@@ -3,10 +3,17 @@ const std = @import("std");
 pub const Node = union(enum) {
     text: []const u8,
     variable: Variable,
+    section: Section,
+    inverted: Section,
 
     pub const Variable = struct {
         name: []const u8,
         escape: bool,
+    };
+
+    pub const Section = struct {
+        name: []const u8,
+        body: []const Node,
     };
 };
 
