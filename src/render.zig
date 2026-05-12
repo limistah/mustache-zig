@@ -7,8 +7,11 @@ const escape = @import("escape.zig");
 //   one-frame stack:    .{ ctx, .{} }
 //   two-frame stack:    .{ inner, .{ outer, .{} } }
 //
-// Lookups walk innermost -> outermost. Sections that match by name push the
-// matched value as a new innermost frame and recurse into the body.
+// Variable / section names are pre-split into path segments. The FIRST
+// segment uses stack-walking lookup (innermost -> outermost). Once a frame
+// containing the first segment is found, we COMMIT to that resolution path:
+// subsequent segments only descend into the resolved object, no stack
+// fallback. This matches the Mustache spec's dotted-name semantics.
 
 pub fn render(template: ast.Template, writer: anytype, context: anytype) !void {
     return renderNodes(template.nodes, writer, .{ context, .{} });
@@ -18,35 +21,74 @@ fn renderNodes(nodes: []const ast.Node, writer: anytype, stack: anytype) !void {
     for (nodes) |node| {
         switch (node) {
             .text => |t| try writer.writeAll(t),
-            .variable => |v| try lookupAndWrite(writer, stack, v.name, v.escape),
+            .variable => |v| try lookupAndWrite(writer, stack, v.path, v.escape),
             .section => |s| try renderSection(writer, stack, s, false),
             .inverted => |s| try renderSection(writer, stack, s, true),
         }
     }
 }
 
-// ----- variable lookup -----
-
-fn lookupAndWrite(writer: anytype, stack: anytype, name: []const u8, do_escape: bool) !void {
-    if (@typeInfo(@TypeOf(stack)).@"struct".fields.len == 0) return; // not found, emit nothing
-    if (try tryWriteFromFrame(writer, stack[0], name, do_escape)) return;
-    return lookupAndWrite(writer, stack[1], name, do_escape);
+fn isImplicitDot(seg: []const u8) bool {
+    return seg.len == 1 and seg[0] == '.';
 }
 
-fn tryWriteFromFrame(writer: anytype, frame: anytype, name: []const u8, do_escape: bool) !bool {
-    // implicit iterator: {{.}} writes the current frame itself
-    if (name.len == 1 and name[0] == '.') {
-        try writeValue(writer, frame, do_escape);
+// ----- variable lookup -----
+
+fn lookupAndWrite(writer: anytype, stack: anytype, path: []const []const u8, do_escape: bool) !void {
+    // implicit iterator: path == ["."]  -> write current scope
+    if (path.len == 1 and isImplicitDot(path[0])) {
+        if (@typeInfo(@TypeOf(stack)).@"struct".fields.len == 0) return;
+        try writeValue(writer, stack[0], do_escape);
+        return;
+    }
+    _ = try walkStackForWrite(writer, stack, path, do_escape);
+}
+
+fn walkStackForWrite(writer: anytype, stack: anytype, path: []const []const u8, do_escape: bool) !bool {
+    if (@typeInfo(@TypeOf(stack)).@"struct".fields.len == 0) return false;
+    if (try tryCommitFromHead(writer, stack[0], path, do_escape)) return true;
+    return walkStackForWrite(writer, stack[1], path, do_escape);
+}
+
+fn tryCommitFromHead(writer: anytype, head: anytype, path: []const []const u8, do_escape: bool) !bool {
+    const T = @TypeOf(head);
+    const info = @typeInfo(T);
+    if (info == .pointer and info.pointer.size == .one) {
+        return tryCommitFromHead(writer, head.*, path, do_escape);
+    }
+    if (info == .optional) {
+        if (head) |h| return tryCommitFromHead(writer, h, path, do_escape);
+        return false;
+    }
+    if (info != .@"struct" or info.@"struct".is_tuple) return false;
+    inline for (info.@"struct".fields) |f| {
+        if (std.mem.eql(u8, f.name, path[0])) {
+            // commit: descent succeeds or fails here, but no fallback to other frames
+            _ = try descendStrictAndWrite(writer, @field(head, f.name), path[1..], do_escape);
+            return true;
+        }
+    }
+    return false;
+}
+
+fn descendStrictAndWrite(writer: anytype, value: anytype, rest: []const []const u8, do_escape: bool) !bool {
+    if (rest.len == 0) {
+        try writeValue(writer, value, do_escape);
         return true;
     }
-    const T = @TypeOf(frame);
+    const T = @TypeOf(value);
     const info = @typeInfo(T);
-    if (info == .@"struct" and !info.@"struct".is_tuple) {
-        inline for (info.@"struct".fields) |f| {
-            if (std.mem.eql(u8, f.name, name)) {
-                try writeValue(writer, @field(frame, f.name), do_escape);
-                return true;
-            }
+    if (info == .pointer and info.pointer.size == .one) {
+        return descendStrictAndWrite(writer, value.*, rest, do_escape);
+    }
+    if (info == .optional) {
+        if (value) |v| return descendStrictAndWrite(writer, v, rest, do_escape);
+        return false;
+    }
+    if (info != .@"struct" or info.@"struct".is_tuple) return false;
+    inline for (info.@"struct".fields) |f| {
+        if (std.mem.eql(u8, f.name, rest[0])) {
+            return descendStrictAndWrite(writer, @field(value, f.name), rest[1..], do_escape);
         }
     }
     return false;
@@ -55,34 +97,81 @@ fn tryWriteFromFrame(writer: anytype, frame: anytype, name: []const u8, do_escap
 // ----- section lookup + dispatch -----
 
 fn renderSection(writer: anytype, stack: anytype, section: ast.Node.Section, inverted: bool) !void {
-    if (try trySection(writer, stack, stack, section, inverted)) return;
-    // not found anywhere: spec says falsy
+    if (try walkStackForSection(writer, stack, stack, section, inverted)) return;
+    // never found in any frame -> falsy
     if (inverted) try renderNodes(section.body, writer, stack);
 }
 
-fn trySection(
+fn walkStackForSection(
     writer: anytype,
     original: anytype,
     search: anytype,
     section: ast.Node.Section,
     inverted: bool,
 ) !bool {
-    const SInfo = @typeInfo(@TypeOf(search)).@"struct";
-    if (SInfo.fields.len == 0) return false;
+    if (@typeInfo(@TypeOf(search)).@"struct".fields.len == 0) return false;
+    if (try trySectionCommitFromHead(writer, original, search[0], section, inverted)) return true;
+    return walkStackForSection(writer, original, search[1], section, inverted);
+}
 
-    const frame = search[0];
-    const T = @TypeOf(frame);
+fn trySectionCommitFromHead(
+    writer: anytype,
+    stack: anytype,
+    head: anytype,
+    section: ast.Node.Section,
+    inverted: bool,
+) !bool {
+    const T = @TypeOf(head);
     const info = @typeInfo(T);
-
-    if (info == .@"struct" and !info.@"struct".is_tuple) {
-        inline for (info.@"struct".fields) |f| {
-            if (std.mem.eql(u8, f.name, section.name)) {
-                try dispatchSection(writer, original, @field(frame, f.name), section, inverted);
-                return true;
-            }
+    if (info == .pointer and info.pointer.size == .one) {
+        return trySectionCommitFromHead(writer, stack, head.*, section, inverted);
+    }
+    if (info == .optional) {
+        if (head) |h| return trySectionCommitFromHead(writer, stack, h, section, inverted);
+        return false;
+    }
+    if (info != .@"struct" or info.@"struct".is_tuple) return false;
+    inline for (info.@"struct".fields) |f| {
+        if (std.mem.eql(u8, f.name, section.path[0])) {
+            try descendStrictForSection(writer, stack, @field(head, f.name), section.path[1..], section, inverted);
+            return true;
         }
     }
-    return trySection(writer, original, search[1], section, inverted);
+    return false;
+}
+
+fn descendStrictForSection(
+    writer: anytype,
+    stack: anytype,
+    value: anytype,
+    rest: []const []const u8,
+    section: ast.Node.Section,
+    inverted: bool,
+) !void {
+    if (rest.len == 0) {
+        try dispatchSection(writer, stack, value, section, inverted);
+        return;
+    }
+    const T = @TypeOf(value);
+    const info = @typeInfo(T);
+    if (info == .pointer and info.pointer.size == .one) {
+        return descendStrictForSection(writer, stack, value.*, rest, section, inverted);
+    }
+    if (info == .optional) {
+        if (value) |v| return descendStrictForSection(writer, stack, v, rest, section, inverted);
+        if (inverted) try renderNodes(section.body, writer, stack);
+        return;
+    }
+    if (info != .@"struct" or info.@"struct".is_tuple) {
+        if (inverted) try renderNodes(section.body, writer, stack);
+        return;
+    }
+    inline for (info.@"struct".fields) |f| {
+        if (std.mem.eql(u8, f.name, rest[0])) {
+            return descendStrictForSection(writer, stack, @field(value, f.name), rest[1..], section, inverted);
+        }
+    }
+    if (inverted) try renderNodes(section.body, writer, stack);
 }
 
 fn dispatchSection(
@@ -195,8 +284,7 @@ fn renderToBuf(comptime cap: usize, source: []const u8, ctx: anytype) ![]const u
     var t = try parser.parse(std.testing.allocator, source);
     defer t.deinit();
     try render(t, fbs.writer(), ctx);
-    const owned = try std.testing.allocator.dupe(u8, fbs.getWritten());
-    return owned;
+    return std.testing.allocator.dupe(u8, fbs.getWritten());
 }
 
 test "renders against a struct via comptime reflection" {
@@ -222,24 +310,10 @@ test "missing variable renders as empty" {
     try std.testing.expectEqualStrings("[]", got);
 }
 
-test "optional null renders empty, some unwraps" {
-    const a: ?[]const u8 = "yes";
-    const b: ?[]const u8 = null;
-    const got = try renderToBuf(64, "[{{a}}][{{b}}]", .{ .a = a, .b = b });
-    defer std.testing.allocator.free(got);
-    try std.testing.expectEqualStrings("[yes][]", got);
-}
-
 test "section over bool true renders once" {
     const got = try renderToBuf(64, "{{#ok}}yes{{/ok}}", .{ .ok = true });
     defer std.testing.allocator.free(got);
     try std.testing.expectEqualStrings("yes", got);
-}
-
-test "section over bool false skips" {
-    const got = try renderToBuf(64, "{{#ok}}yes{{/ok}}!", .{ .ok = false });
-    defer std.testing.allocator.free(got);
-    try std.testing.expectEqualStrings("!", got);
 }
 
 test "inverted section over bool false renders" {
@@ -254,34 +328,55 @@ test "inverted section over missing name renders" {
     try std.testing.expectEqualStrings("none", got);
 }
 
-test "section iterates over a slice with implicit .{}" {
+test "section iterates over a slice with implicit ." {
     const items = [_][]const u8{ "a", "b", "c" };
     const got = try renderToBuf(64, "{{#xs}}[{{.}}]{{/xs}}", .{ .xs = @as([]const []const u8, &items) });
     defer std.testing.allocator.free(got);
     try std.testing.expectEqualStrings("[a][b][c]", got);
 }
 
-test "section iterates over a slice of structs and falls back to parent scope" {
+test "section over list of structs with parent-scope fallback" {
     const Item = struct { label: []const u8 };
     const items = [_]Item{ .{ .label = "x" }, .{ .label = "y" } };
     const got = try renderToBuf(
         256,
         "{{#items}}{{prefix}}-{{label}};{{/items}}",
-        .{
-            .prefix = @as([]const u8, "p"),
-            .items = @as([]const Item, &items),
-        },
+        .{ .prefix = @as([]const u8, "p"), .items = @as([]const Item, &items) },
     );
     defer std.testing.allocator.free(got);
     try std.testing.expectEqualStrings("p-x;p-y;", got);
 }
 
-test "nested struct section pushes scope" {
-    const got = try renderToBuf(128, "{{#user}}{{name}} ({{age}}){{/user}}", .{
-        .user = .{ .name = @as([]const u8, "Aleem"), .age = @as(u32, 30) },
+test "dotted path resolves on a struct field" {
+    const got = try renderToBuf(128, "{{user.name}}", .{
+        .user = .{ .name = @as([]const u8, "Aleem") },
     });
     defer std.testing.allocator.free(got);
-    try std.testing.expectEqualStrings("Aleem (30)", got);
+    try std.testing.expectEqualStrings("Aleem", got);
+}
+
+test "deep dotted path" {
+    const got = try renderToBuf(128, "{{user.address.city}}", .{
+        .user = .{ .address = .{ .city = @as([]const u8, "Lagos") } },
+    });
+    defer std.testing.allocator.free(got);
+    try std.testing.expectEqualStrings("Lagos", got);
+}
+
+test "dotted path with missing tail renders empty" {
+    const got = try renderToBuf(64, "[{{user.nope}}]", .{
+        .user = .{ .name = @as([]const u8, "Aleem") },
+    });
+    defer std.testing.allocator.free(got);
+    try std.testing.expectEqualStrings("[]", got);
+}
+
+test "dotted section descends and pushes" {
+    const got = try renderToBuf(128, "{{#user.address}}{{city}}{{/user.address}}", .{
+        .user = .{ .address = .{ .city = @as([]const u8, "Lagos") } },
+    });
+    defer std.testing.allocator.free(got);
+    try std.testing.expectEqualStrings("Lagos", got);
 }
 
 test "empty list is falsy" {

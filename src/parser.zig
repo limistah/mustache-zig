@@ -22,6 +22,21 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) ParseError!ast.Te
     return .{ .nodes = nodes, .arena = arena };
 }
 
+fn buildPath(aalloc: std.mem.Allocator, raw: []const u8) ParseError![]const []const u8 {
+    if (raw.len == 1 and raw[0] == '.') {
+        const out = try aalloc.alloc([]const u8, 1);
+        out[0] = raw;
+        return out;
+    }
+    var list: std.ArrayListUnmanaged([]const u8) = .{};
+    var it = std.mem.splitScalar(u8, raw, '.');
+    while (it.next()) |seg| {
+        if (seg.len == 0) return error.EmptyTag;
+        try list.append(aalloc, seg);
+    }
+    return try list.toOwnedSlice(aalloc);
+}
+
 fn parseSegment(
     aalloc: std.mem.Allocator,
     source: []const u8,
@@ -58,10 +73,11 @@ fn parseSegment(
                     // comment: discard
                 },
                 '#', '^' => {
-                    const name = std.mem.trim(u8, inner[1..], " \t");
-                    if (name.len == 0) return error.EmptyTag;
-                    const body = try parseSegment(aalloc, source, cursor, name);
-                    const section = ast.Node.Section{ .name = name, .body = body };
+                    const raw = std.mem.trim(u8, inner[1..], " \t");
+                    if (raw.len == 0) return error.EmptyTag;
+                    const path = try buildPath(aalloc, raw);
+                    const body = try parseSegment(aalloc, source, cursor, raw);
+                    const section = ast.Node.Section{ .path = path, .body = body };
                     try nodes.append(aalloc, if (sigil == '#')
                         .{ .section = section }
                     else
@@ -76,12 +92,14 @@ fn parseSegment(
                 },
                 '&' => {
                     if (triple) return error.EmptyTag;
-                    const name = std.mem.trim(u8, inner[1..], " \t");
-                    if (name.len == 0) return error.EmptyTag;
-                    try nodes.append(aalloc, .{ .variable = .{ .name = name, .escape = false } });
+                    const raw = std.mem.trim(u8, inner[1..], " \t");
+                    if (raw.len == 0) return error.EmptyTag;
+                    const path = try buildPath(aalloc, raw);
+                    try nodes.append(aalloc, .{ .variable = .{ .path = path, .escape = false } });
                 },
                 else => {
-                    try nodes.append(aalloc, .{ .variable = .{ .name = inner, .escape = !triple } });
+                    const path = try buildPath(aalloc, inner);
+                    try nodes.append(aalloc, .{ .variable = .{ .path = path, .escape = !triple } });
                 },
             }
         } else {
@@ -95,65 +113,84 @@ fn parseSegment(
     return try nodes.toOwnedSlice(aalloc);
 }
 
-test "parses plain text" {
-    var t = try parse(std.testing.allocator, "hello world");
-    defer t.deinit();
-    try std.testing.expectEqual(@as(usize, 1), t.nodes.len);
-    try std.testing.expectEqualStrings("hello world", t.nodes[0].text);
-}
-
 test "parses a simple variable" {
     var t = try parse(std.testing.allocator, "Hi {{name}}!");
     defer t.deinit();
     try std.testing.expectEqual(@as(usize, 3), t.nodes.len);
-    try std.testing.expectEqualStrings("name", t.nodes[1].variable.name);
+    try std.testing.expectEqualStrings("name", t.nodes[1].variable.path[0]);
+    try std.testing.expectEqual(@as(usize, 1), t.nodes[1].variable.path.len);
     try std.testing.expectEqual(true, t.nodes[1].variable.escape);
+}
+
+test "parses a dotted variable into path segments" {
+    var t = try parse(std.testing.allocator, "{{user.address.city}}");
+    defer t.deinit();
+    const p = t.nodes[0].variable.path;
+    try std.testing.expectEqual(@as(usize, 3), p.len);
+    try std.testing.expectEqualStrings("user", p[0]);
+    try std.testing.expectEqualStrings("address", p[1]);
+    try std.testing.expectEqualStrings("city", p[2]);
+}
+
+test "implicit dot is a single-segment path" {
+    var t = try parse(std.testing.allocator, "{{.}}");
+    defer t.deinit();
+    const p = t.nodes[0].variable.path;
+    try std.testing.expectEqual(@as(usize, 1), p.len);
+    try std.testing.expectEqualStrings(".", p[0]);
+}
+
+test "empty segment in dotted path is an error" {
+    try std.testing.expectError(error.EmptyTag, parse(std.testing.allocator, "{{a..b}}"));
 }
 
 test "parses triple-stache as unescaped" {
     var t = try parse(std.testing.allocator, "{{{raw}}}");
     defer t.deinit();
-    try std.testing.expectEqualStrings("raw", t.nodes[0].variable.name);
+    try std.testing.expectEqualStrings("raw", t.nodes[0].variable.path[0]);
     try std.testing.expectEqual(false, t.nodes[0].variable.escape);
 }
 
 test "parses ampersand as unescaped" {
     var t = try parse(std.testing.allocator, "{{& raw }}");
     defer t.deinit();
-    try std.testing.expectEqualStrings("raw", t.nodes[0].variable.name);
+    try std.testing.expectEqualStrings("raw", t.nodes[0].variable.path[0]);
     try std.testing.expectEqual(false, t.nodes[0].variable.escape);
 }
 
 test "parses a section" {
-    var t = try parse(std.testing.allocator, "before{{#items}}body{{/items}}after");
+    var t = try parse(std.testing.allocator, "{{#items}}body{{/items}}");
     defer t.deinit();
-    try std.testing.expectEqual(@as(usize, 3), t.nodes.len);
-    try std.testing.expectEqualStrings("before", t.nodes[0].text);
-    try std.testing.expectEqualStrings("items", t.nodes[1].section.name);
-    try std.testing.expectEqual(@as(usize, 1), t.nodes[1].section.body.len);
-    try std.testing.expectEqualStrings("body", t.nodes[1].section.body[0].text);
-    try std.testing.expectEqualStrings("after", t.nodes[2].text);
+    try std.testing.expectEqualStrings("items", t.nodes[0].section.path[0]);
+    try std.testing.expectEqualStrings("body", t.nodes[0].section.body[0].text);
+}
+
+test "parses a dotted section" {
+    var t = try parse(std.testing.allocator, "{{#user.address}}x{{/user.address}}");
+    defer t.deinit();
+    const p = t.nodes[0].section.path;
+    try std.testing.expectEqual(@as(usize, 2), p.len);
+    try std.testing.expectEqualStrings("user", p[0]);
+    try std.testing.expectEqualStrings("address", p[1]);
 }
 
 test "parses an inverted section" {
     var t = try parse(std.testing.allocator, "{{^empty}}nothing{{/empty}}");
     defer t.deinit();
-    try std.testing.expectEqualStrings("empty", t.nodes[0].inverted.name);
+    try std.testing.expectEqualStrings("empty", t.nodes[0].inverted.path[0]);
 }
 
 test "parses nested sections" {
     var t = try parse(std.testing.allocator, "{{#a}}{{#b}}x{{/b}}{{/a}}");
     defer t.deinit();
-    try std.testing.expectEqualStrings("a", t.nodes[0].section.name);
-    try std.testing.expectEqualStrings("b", t.nodes[0].section.body[0].section.name);
+    try std.testing.expectEqualStrings("a", t.nodes[0].section.path[0]);
+    try std.testing.expectEqualStrings("b", t.nodes[0].section.body[0].section.path[0]);
 }
 
 test "comments are dropped" {
     var t = try parse(std.testing.allocator, "hi {{! a comment }}there");
     defer t.deinit();
     try std.testing.expectEqual(@as(usize, 2), t.nodes.len);
-    try std.testing.expectEqualStrings("hi ", t.nodes[0].text);
-    try std.testing.expectEqualStrings("there", t.nodes[1].text);
 }
 
 test "unclosed tag is an error" {

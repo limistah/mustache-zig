@@ -7,12 +7,12 @@ pub const Node = union(enum) {
     inverted: Section,
 
     pub const Variable = struct {
-        name: []const u8,
+        path: []const []const u8,
         escape: bool,
     };
 
     pub const Section = struct {
-        name: []const u8,
+        path: []const []const u8,
         body: []const Node,
     };
 };
