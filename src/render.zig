@@ -385,3 +385,22 @@ test "empty list is falsy" {
     defer std.testing.allocator.free(got);
     try std.testing.expectEqualStrings("empty", got);
 }
+
+test "standalone section tags don't leak newlines" {
+    // Without standalone-stripping this would render as "\nhi\n\n".
+    const got = try renderToBuf(64, "{{#ok}}\nhi\n{{/ok}}\n", .{ .ok = true });
+    defer std.testing.allocator.free(got);
+    try std.testing.expectEqualStrings("hi\n", got);
+}
+
+test "standalone comment leaves the surrounding template intact" {
+    const got = try renderToBuf(64, "before\n{{! note }}\nafter\n", .{});
+    defer std.testing.allocator.free(got);
+    try std.testing.expectEqualStrings("before\nafter\n", got);
+}
+
+test "non-standalone variable preserves its trailing newline" {
+    const got = try renderToBuf(64, "{{x}}\nrest\n", .{ .x = @as([]const u8, "v") });
+    defer std.testing.allocator.free(got);
+    try std.testing.expectEqualStrings("v\nrest\n", got);
+}
