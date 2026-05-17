@@ -22,24 +22,24 @@ pub fn html(writer: anytype, input: []const u8) !void {
 
 test "escapes the five characters" {
     var buf: [256]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    try html(fbs.writer(), "<a href=\"x\">it's & ok</a>");
+    var w = std.Io.Writer.fixed(&buf);
+    try html(&w, "<a href=\"x\">it's & ok</a>");
     try std.testing.expectEqualStrings(
         "&lt;a href=&quot;x&quot;&gt;it&#39;s &amp; ok&lt;/a&gt;",
-        fbs.getWritten(),
+        w.buffered(),
     );
 }
 
 test "passthrough for plain text" {
     var buf: [64]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    try html(fbs.writer(), "hello world");
-    try std.testing.expectEqualStrings("hello world", fbs.getWritten());
+    var w = std.Io.Writer.fixed(&buf);
+    try html(&w, "hello world");
+    try std.testing.expectEqualStrings("hello world", w.buffered());
 }
 
 test "empty input" {
     var buf: [16]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    try html(fbs.writer(), "");
-    try std.testing.expectEqualStrings("", fbs.getWritten());
+    var w = std.Io.Writer.fixed(&buf);
+    try html(&w, "");
+    try std.testing.expectEqualStrings("", w.buffered());
 }

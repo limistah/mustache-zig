@@ -33,7 +33,7 @@ fn buildPath(aalloc: std.mem.Allocator, raw: []const u8) ParseError![]const []co
         out[0] = raw;
         return out;
     }
-    var list: std.ArrayListUnmanaged([]const u8) = .{};
+    var list: std.ArrayList([]const u8) = .empty;
     var it = std.mem.splitScalar(u8, raw, '.');
     while (it.next()) |seg| {
         if (seg.len == 0) return error.EmptyTag;
@@ -45,7 +45,12 @@ fn buildPath(aalloc: std.mem.Allocator, raw: []const u8) ParseError![]const []co
 fn consumeStandaloneTail(state: *State, standalone: bool, rhs_end: usize) void {
     if (!standalone) return;
     state.cursor = rhs_end;
-    if (state.cursor < state.source.len and state.source[state.cursor] == '\n') {
+    // Treat both "\n" and "\r\n" as a line terminator.
+    if (state.cursor < state.source.len and state.source[state.cursor] == '\r' and
+        state.cursor + 1 < state.source.len and state.source[state.cursor + 1] == '\n')
+    {
+        state.cursor += 2;
+    } else if (state.cursor < state.source.len and state.source[state.cursor] == '\n') {
         state.cursor += 1;
     }
     state.line_start = state.cursor;
@@ -56,7 +61,7 @@ fn parseSegment(
     state: *State,
     end_section: ?[]const u8,
 ) ParseError![]ast.Node {
-    var nodes: std.ArrayListUnmanaged(ast.Node) = .{};
+    var nodes: std.ArrayList(ast.Node) = .empty;
     var text_start = state.cursor;
     const src = state.source;
 
@@ -66,6 +71,11 @@ fn parseSegment(
 
         if (c == '\n') {
             state.cursor += 1;
+            state.line_start = state.cursor;
+            continue;
+        }
+        if (c == '\r' and i + 1 < src.len and src[i + 1] == '\n') {
+            state.cursor += 2;
             state.line_start = state.cursor;
             continue;
         }
@@ -106,7 +116,8 @@ fn parseSegment(
         }
         var rhs_end = after_close;
         while (rhs_end < src.len and (src[rhs_end] == ' ' or src[rhs_end] == '\t')) : (rhs_end += 1) {}
-        const rhs_at_newline = rhs_end >= src.len or src[rhs_end] == '\n';
+        const rhs_at_newline = rhs_end >= src.len or src[rhs_end] == '\n' or
+            (src[rhs_end] == '\r' and rhs_end + 1 < src.len and src[rhs_end + 1] == '\n');
 
         const standalone = is_block and lhs_is_ws and rhs_at_newline;
 

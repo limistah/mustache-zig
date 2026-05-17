@@ -1,14 +1,11 @@
 // Mustache spec conformance runner.
 //
-// Clone github.com/mustache/spec into ./spec (as a submodule or plain clone)
-// and run with:
+// Clone github.com/mustache/spec into ./spec and run with:
 //
 //     zig build spec
 //
-// The spec repository ships JSON renderings of each suite alongside the YAML
-// source. We read the four required suites and skip the optional ones for
-// now (~lambdas, ~dynamic-names, ~inheritance). Partials are also absent
-// because the renderer doesn't support them yet.
+// Reads the four required suites from the spec repo's checked-in JSON
+// renditions. Partials, delimiters, and lambdas are deferred.
 
 const std = @import("std");
 const mustache = @import("mustache");
@@ -33,61 +30,71 @@ const SpecCase = struct {
     expected: []const u8,
 };
 
-pub fn main() !void {
-    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
-    defer _ = gpa.deinit();
-    const alloc = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const alloc = init.gpa;
+    const io = init.io;
+
+    var err_buf: [4096]u8 = undefined;
+    var err_writer = std.Io.File.stderr().writer(io, &err_buf);
+    const err = &err_writer.interface;
+    defer err.flush() catch {};
 
     var total: usize = 0;
     var passed: usize = 0;
     var fail_count: usize = 0;
 
-    const stderr = std.io.getStdErr().writer();
-
     for (required_suites) |path| {
-        const file = std.fs.cwd().openFile(path, .{}) catch |err| {
-            try stderr.print("could not open {s}: {s}\n", .{ path, @errorName(err) });
-            try stderr.writeAll("(clone github.com/mustache/spec into ./spec first)\n");
+        const cwd = std.Io.Dir.cwd();
+        const file = cwd.openFile(io, path, .{}) catch |e| {
+            try err.print("could not open {s}: {s}\n", .{ path, @errorName(e) });
+            try err.writeAll("(clone github.com/mustache/spec into ./spec first)\n");
+            try err.flush();
             std.process.exit(2);
         };
-        defer file.close();
-        const contents = try file.readToEndAlloc(alloc, 16 * 1024 * 1024);
+        defer file.close(io);
+        const len_u64 = try file.length(io);
+        const len: usize = @intCast(len_u64);
+        const contents = try alloc.alloc(u8, len);
         defer alloc.free(contents);
+        _ = try file.readPositionalAll(io, contents, 0);
 
         var parsed = try std.json.parseFromSlice(SpecFile, alloc, contents, .{
             .ignore_unknown_fields = true,
         });
         defer parsed.deinit();
 
-        try stderr.print("--- {s} ({d} cases)\n", .{ path, parsed.value.tests.len });
+        try err.print("--- {s} ({d} cases)\n", .{ path, parsed.value.tests.len });
 
         for (parsed.value.tests) |case| {
             total += 1;
-            const result = runCase(alloc, case) catch |err| {
+            const result = runCase(alloc, case) catch |e| {
                 fail_count += 1;
-                try stderr.print("  ERR  {s}: {s}\n", .{ case.name, @errorName(err) });
+                try err.print("  ERR  {s}: {s}\n", .{ case.name, @errorName(e) });
                 continue;
             };
             if (result.ok) {
                 passed += 1;
             } else {
                 fail_count += 1;
-                try stderr.print("  FAIL {s}\n", .{case.name});
-                try stderr.print("       desc:     {s}\n", .{case.desc});
-                try stderr.print("       template: {s}\n", .{quoteOneLine(case.template)});
-                try stderr.print("       expected: {s}\n", .{quoteOneLine(case.expected)});
-                try stderr.print("       got:      {s}\n", .{quoteOneLine(result.got)});
+                try err.print("  FAIL {s}\n    desc:     {s}\n    template: {s}\n    expected: {s}\n    got:      {s}\n", .{
+                    case.name,
+                    case.desc,
+                    case.template,
+                    case.expected,
+                    result.got,
+                });
             }
             alloc.free(result.got);
         }
     }
 
-    try stderr.print("\n{d}/{d} passed", .{ passed, total });
+    try err.print("\n{d}/{d} passed", .{ passed, total });
     if (fail_count > 0) {
-        try stderr.print(" ({d} failed)\n", .{fail_count});
+        try err.print(" ({d} failed)\n", .{fail_count});
+        try err.flush();
         std.process.exit(1);
     }
-    try stderr.writeAll("\n");
+    try err.writeAll("\n");
 }
 
 const CaseResult = struct {
@@ -103,18 +110,10 @@ fn runCase(allocator: std.mem.Allocator, case: SpecCase) !CaseResult {
     defer arena.deinit();
     const data = try mustache.valueFromJson(arena.allocator(), case.data);
 
-    var out: std.ArrayList(u8) = .init(allocator);
-    errdefer out.deinit();
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    try mustache.render(tmpl, &aw.writer, data);
 
-    try mustache.render(tmpl, out.writer(), data);
-
-    const got = try out.toOwnedSlice();
+    const got = try aw.toOwnedSlice();
     return .{ .ok = std.mem.eql(u8, got, case.expected), .got = got };
-}
-
-// Replace newlines and tabs with their escaped forms for one-line diff output.
-fn quoteOneLine(s: []const u8) []const u8 {
-    // We can't allocate inside this helper without complicating callers.
-    // Just return the raw string; the caller's print handles whatever's in it.
-    return s;
 }
