@@ -15,6 +15,7 @@ const required_suites = [_][]const u8{
     "spec/specs/interpolation.json",
     "spec/specs/sections.json",
     "spec/specs/inverted.json",
+    "spec/specs/delimiters.json",
 };
 
 const SpecFile = struct {

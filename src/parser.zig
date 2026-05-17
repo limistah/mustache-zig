@@ -7,12 +7,19 @@ pub const ParseError = error{
     UnclosedSection,
     UnexpectedClose,
     MismatchedClose,
+    InvalidDelimiterTag,
 } || std.mem.Allocator.Error;
 
 const State = struct {
     source: []const u8,
     cursor: usize,
     line_start: usize,
+    open: []const u8,
+    close: []const u8,
+
+    fn defaultDelims(self: *const State) bool {
+        return std.mem.eql(u8, self.open, "{{") and std.mem.eql(u8, self.close, "}}");
+    }
 };
 
 pub fn parse(allocator: std.mem.Allocator, source: []const u8) ParseError!ast.Template {
@@ -21,7 +28,13 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) ParseError!ast.Te
     const aalloc = arena.allocator();
 
     const owned = try aalloc.dupe(u8, source);
-    var state = State{ .source = owned, .cursor = 0, .line_start = 0 };
+    var state = State{
+        .source = owned,
+        .cursor = 0,
+        .line_start = 0,
+        .open = "{{",
+        .close = "}}",
+    };
     const nodes = try parseSegment(aalloc, &state, null);
 
     return .{ .nodes = nodes, .arena = arena };
@@ -45,7 +58,6 @@ fn buildPath(aalloc: std.mem.Allocator, raw: []const u8) ParseError![]const []co
 fn consumeStandaloneTail(state: *State, standalone: bool, rhs_end: usize) void {
     if (!standalone) return;
     state.cursor = rhs_end;
-    // Treat both "\n" and "\r\n" as a line terminator.
     if (state.cursor < state.source.len and state.source[state.cursor] == '\r' and
         state.cursor + 1 < state.source.len and state.source[state.cursor + 1] == '\n')
     {
@@ -63,9 +75,9 @@ fn parseSegment(
 ) ParseError![]ast.Node {
     var nodes: std.ArrayList(ast.Node) = .empty;
     var text_start = state.cursor;
-    const src = state.source;
 
-    while (state.cursor < src.len) {
+    while (state.cursor < state.source.len) {
+        const src = state.source;
         const i = state.cursor;
         const c = src[i];
 
@@ -80,15 +92,17 @@ fn parseSegment(
             continue;
         }
 
-        if (!(i + 1 < src.len and c == '{' and src[i + 1] == '{')) {
+        if (!startsWithAt(src, i, state.open)) {
             state.cursor += 1;
             continue;
         }
 
-        const after_open = i + 2;
-        const triple = after_open < src.len and src[after_open] == '{';
+        const after_open = i + state.open.len;
+
+        // triple-stache only when delimiters are the default {{ / }}
+        const triple = state.defaultDelims() and after_open < src.len and src[after_open] == '{';
         const tag_start = if (triple) after_open + 1 else after_open;
-        const close_seq: []const u8 = if (triple) "}}}" else "}}";
+        const close_seq: []const u8 = if (triple) "}}}" else state.close;
 
         const close_idx = std.mem.indexOfPos(u8, src, tag_start, close_seq) orelse
             return error.UnclosedTag;
@@ -98,7 +112,7 @@ fn parseSegment(
 
         const sigil = inner[0];
         const is_block = !triple and
-            (sigil == '#' or sigil == '^' or sigil == '/' or sigil == '!');
+            (sigil == '#' or sigil == '^' or sigil == '/' or sigil == '!' or sigil == '=');
 
         const after_close = close_idx + close_seq.len;
 
@@ -121,8 +135,6 @@ fn parseSegment(
 
         const standalone = is_block and lhs_is_ws and rhs_at_newline;
 
-        // emit pending text — for standalone tags we drop the leading whitespace
-        // of the tag's line
         const text_end = if (standalone) state.line_start else i;
         if (text_end > text_start) {
             try nodes.append(aalloc, .{ .text = src[text_start..text_end] });
@@ -131,9 +143,7 @@ fn parseSegment(
         state.cursor = after_close;
 
         switch (sigil) {
-            '!' => {
-                consumeStandaloneTail(state, standalone, rhs_end);
-            },
+            '!' => consumeStandaloneTail(state, standalone, rhs_end),
             '#', '^' => {
                 const raw = std.mem.trim(u8, inner[1..], " \t");
                 if (raw.len == 0) return error.EmptyTag;
@@ -160,6 +170,20 @@ fn parseSegment(
                 const path = try buildPath(aalloc, raw);
                 try nodes.append(aalloc, .{ .variable = .{ .path = path, .escape = false } });
             },
+            '=' => {
+                // {{=NEW_OPEN NEW_CLOSE=}}  (with current open/close)
+                if (inner.len < 3 or inner[inner.len - 1] != '=') return error.InvalidDelimiterTag;
+                const middle = std.mem.trim(u8, inner[1 .. inner.len - 1], " \t");
+                const ws = std.mem.indexOfAny(u8, middle, " \t") orelse return error.InvalidDelimiterTag;
+                const new_open = middle[0..ws];
+                const new_close = std.mem.trimStart(u8, middle[ws..], " \t");
+                if (new_open.len == 0 or new_close.len == 0) return error.InvalidDelimiterTag;
+                if (std.mem.indexOfAny(u8, new_open, " \t") != null) return error.InvalidDelimiterTag;
+                if (std.mem.indexOfAny(u8, new_close, " \t") != null) return error.InvalidDelimiterTag;
+                state.open = new_open;
+                state.close = new_close;
+                consumeStandaloneTail(state, standalone, rhs_end);
+            },
             else => {
                 const path = try buildPath(aalloc, inner);
                 try nodes.append(aalloc, .{ .variable = .{ .path = path, .escape = !triple } });
@@ -170,11 +194,18 @@ fn parseSegment(
     }
 
     if (end_section != null) return error.UnclosedSection;
-    if (text_start < src.len) {
-        try nodes.append(aalloc, .{ .text = src[text_start..] });
+    if (text_start < state.source.len) {
+        try nodes.append(aalloc, .{ .text = state.source[text_start..] });
     }
     return try nodes.toOwnedSlice(aalloc);
 }
+
+fn startsWithAt(src: []const u8, i: usize, needle: []const u8) bool {
+    if (needle.len == 0 or i + needle.len > src.len) return false;
+    return std.mem.eql(u8, src[i .. i + needle.len], needle);
+}
+
+// ----- tests -----
 
 test "parses a simple variable" {
     var t = try parse(std.testing.allocator, "Hi {{name}}!");
@@ -254,7 +285,6 @@ test "mismatched close is an error" {
 // ----- standalone-line behavior -----
 
 test "comment alone on a line strips the line" {
-    // "a\n{{! c }}\nb"  ->  ["a\n", "b"]
     var t = try parse(std.testing.allocator, "a\n{{! c }}\nb");
     defer t.deinit();
     try std.testing.expectEqual(@as(usize, 2), t.nodes.len);
@@ -279,14 +309,12 @@ test "comment with leading whitespace on its line is standalone" {
 test "comment in mid-line is not standalone" {
     var t = try parse(std.testing.allocator, "x{{!c}}\ny");
     defer t.deinit();
-    // text "x", text "\ny" — comment dropped but \n preserved
     try std.testing.expectEqual(@as(usize, 2), t.nodes.len);
     try std.testing.expectEqualStrings("x", t.nodes[0].text);
     try std.testing.expectEqualStrings("\ny", t.nodes[1].text);
 }
 
 test "section open and close on their own lines strip surrounding newlines" {
-    // "{{#x}}\nbody\n{{/x}}\n" -> section body should be "body\n"; outer should be only the section
     var t = try parse(std.testing.allocator, "{{#x}}\nbody\n{{/x}}\n");
     defer t.deinit();
     try std.testing.expectEqual(@as(usize, 1), t.nodes.len);
@@ -296,9 +324,39 @@ test "section open and close on their own lines strip surrounding newlines" {
 }
 
 test "variable tag does not trigger standalone" {
-    // "{{name}}\n" — variable tag, the trailing \n is preserved
     var t = try parse(std.testing.allocator, "{{name}}\n");
     defer t.deinit();
     try std.testing.expectEqual(@as(usize, 2), t.nodes.len);
     try std.testing.expectEqualStrings("\n", t.nodes[1].text);
+}
+
+// ----- set-delimiter -----
+
+test "set-delimiter changes the current delimiters" {
+    var t = try parse(std.testing.allocator, "{{=<% %>=}}<% name %>");
+    defer t.deinit();
+    // The set-delim tag itself produces no node; the remaining is one variable.
+    try std.testing.expectEqual(@as(usize, 1), t.nodes.len);
+    try std.testing.expectEqualStrings("name", t.nodes[0].variable.path[0]);
+}
+
+test "set-delimiter affects section close" {
+    var t = try parse(std.testing.allocator, "{{=<% %>=}}<%#x%>body<%/x%>");
+    defer t.deinit();
+    try std.testing.expectEqual(@as(usize, 1), t.nodes.len);
+    try std.testing.expectEqualStrings("x", t.nodes[0].section.path[0]);
+    try std.testing.expectEqualStrings("body", t.nodes[0].section.body[0].text);
+}
+
+test "set-delimiter alone on a line is standalone" {
+    var t = try parse(std.testing.allocator, "before\n{{=<% %>=}}\n<%name%>");
+    defer t.deinit();
+    try std.testing.expectEqual(@as(usize, 2), t.nodes.len);
+    try std.testing.expectEqualStrings("before\n", t.nodes[0].text);
+    try std.testing.expectEqualStrings("name", t.nodes[1].variable.path[0]);
+}
+
+test "set-delimiter with invalid format is an error" {
+    try std.testing.expectError(error.InvalidDelimiterTag, parse(std.testing.allocator, "{{= bad =}}"));
+    try std.testing.expectError(error.InvalidDelimiterTag, parse(std.testing.allocator, "{{=<% %> }}"));
 }
