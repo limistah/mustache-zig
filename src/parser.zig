@@ -16,6 +16,17 @@ const State = struct {
     line_start: usize,
     open: []const u8,
     close: []const u8,
+    // Set by the '/' close handler before it returns; lets the open's branch
+    // (typically `<` or `$`) decide compound-standalone retroactively.
+    last_close_standalone: bool = false,
+    // Whether the chars after the just-closed tag (skipping h/v whitespace)
+    // were a newline or EOF. Parent-invocation compound-standalone uses this
+    // to decide whether to absorb the trailing newline, even when the close's
+    // lhs has other content (per spec, parent bodies are "ignored" so other
+    // tags on the close's line don't disqualify standaloneness).
+    last_close_rhs_at_newline: bool = false,
+    // Position right after the rhs whitespace, ready to consume an EOL.
+    last_close_rhs_end: usize = 0,
 
     fn defaultDelims(self: *const State) bool {
         return std.mem.eql(u8, self.open, "{{") and std.mem.eql(u8, self.close, "}}");
@@ -72,6 +83,19 @@ fn parseSegment(
     aalloc: std.mem.Allocator,
     state: *State,
     end_section: ?[]const u8,
+) ParseError![]ast.Node {
+    return parseSegmentEx(aalloc, state, end_section, false);
+}
+
+// `preserve_close_tail`: when true, the matching close tag does NOT consume
+// its trailing newline even if standalone. Used by `$` block bodies so the
+// newline after {{/block}} stays in the partial text — needed for the block
+// to emit a trailing newline at the expansion site.
+fn parseSegmentEx(
+    aalloc: std.mem.Allocator,
+    state: *State,
+    end_section: ?[]const u8,
+    preserve_close_tail: bool,
 ) ParseError![]ast.Node {
     var nodes: std.ArrayList(ast.Node) = .empty;
     var text_start = state.cursor;
@@ -161,7 +185,10 @@ fn parseSegment(
                 const name = std.mem.trim(u8, inner[1..], " \t");
                 if (end_section == null) return error.UnexpectedClose;
                 if (!std.mem.eql(u8, name, end_section.?)) return error.MismatchedClose;
-                consumeStandaloneTail(state, standalone, rhs_end);
+                state.last_close_standalone = standalone;
+                state.last_close_rhs_at_newline = rhs_at_newline;
+                state.last_close_rhs_end = rhs_end;
+                if (!preserve_close_tail) consumeStandaloneTail(state, standalone, rhs_end);
                 return try nodes.toOwnedSlice(aalloc);
             },
             '&' => {
@@ -174,18 +201,84 @@ fn parseSegment(
             '$' => {
                 const raw = std.mem.trim(u8, inner[1..], " \t");
                 if (raw.len == 0) return error.EmptyTag;
+                const intrinsic_indent: []const u8 = if (lhs_is_ws) src[state.line_start..i] else "";
                 consumeStandaloneTail(state, standalone, rhs_end);
-                const body = try parseSegment(aalloc, state, raw);
-                try nodes.append(aalloc, .{ .block = .{ .name = raw, .body = body } });
+                const saved_line_start = state.line_start;
+                state.line_start = state.cursor;
+                // Preserve the close's trailing newline only when the open
+                // wasn't itself standalone: then both tags sat on the same
+                // line, and we need to keep the line's newline as a text
+                // node after the block so the expansion produces it.
+                // When the open is standalone (block spans multiple source
+                // lines), the body's own newlines already provide structure.
+                const body = try parseSegmentEx(aalloc, state, raw, !standalone);
+                state.line_start = saved_line_start;
+                try nodes.append(aalloc, .{ .block = .{
+                    .name = raw,
+                    .body = body,
+                    .indent = intrinsic_indent,
+                } });
             },
             '<' => {
                 const raw = std.mem.trim(u8, inner[1..], " \t");
                 if (raw.len == 0) return error.EmptyTag;
-                const indent: []const u8 = if (standalone) src[state.line_start..i] else "";
+                // Tentative indent: leading whitespace of the open's line if
+                // the open is preceded only by whitespace. Used iff the close
+                // turns out to round out a compound-standalone construct.
+                const tentative_indent: []const u8 = if (lhs_is_ws) src[state.line_start..i] else "";
+                state.last_close_standalone = false;
+                state.last_close_rhs_at_newline = false;
                 consumeStandaloneTail(state, standalone, rhs_end);
+                // Fresh line context inside the parent body.
+                const saved_line_start = state.line_start;
+                state.line_start = state.cursor;
                 const all_body = try parseSegment(aalloc, state, raw);
-                // Inside a parent invocation, only $-blocks contribute; other
-                // content (text, comments) is ignored per spec.
+                state.line_start = saved_line_start;
+
+                // Compound-standalone for `{{<x}}...{{/x}}`: per spec, the
+                // parent body's content is "ignored" for output, so the WHOLE
+                // construct is standalone-eligible if the open's lhs is
+                // whitespace and the close's rhs is whitespace+newline —
+                // regardless of what's between them. We don't require the
+                // close's lhs to be ws (other tags or text inside the body
+                // shouldn't block this).
+                const compound = lhs_is_ws and state.last_close_rhs_at_newline;
+                var indent: []const u8 = "";
+                if (compound) {
+                    // Strip the leading whitespace of the open's line from
+                    // the most-recently-emitted text node, if it ended with
+                    // that exact whitespace.
+                    if (tentative_indent.len > 0 and
+                        nodes.items.len > 0 and
+                        nodes.items[nodes.items.len - 1] == .text)
+                    {
+                        const t = &nodes.items[nodes.items.len - 1].text;
+                        if (t.len >= tentative_indent.len and
+                            std.mem.endsWith(u8, t.*, tentative_indent))
+                        {
+                            t.* = t.*[0 .. t.len - tentative_indent.len];
+                        }
+                    }
+                    indent = tentative_indent;
+                    // Consume the trailing newline if the close handler
+                    // didn't already (which it only does when the close was
+                    // independently standalone).
+                    if (!state.last_close_standalone) {
+                        state.cursor = state.last_close_rhs_end;
+                        if (state.cursor < state.source.len) {
+                            if (state.source[state.cursor] == '\r' and
+                                state.cursor + 1 < state.source.len and
+                                state.source[state.cursor + 1] == '\n')
+                            {
+                                state.cursor += 2;
+                            } else if (state.source[state.cursor] == '\n') {
+                                state.cursor += 1;
+                            }
+                            state.line_start = state.cursor;
+                        }
+                    }
+                }
+
                 var blocks: std.ArrayList(ast.Node.Block) = .empty;
                 for (all_body) |n| {
                     if (n == .block) try blocks.append(aalloc, n.block);

@@ -20,9 +20,15 @@ pub const Node = union(enum) {
     };
 
     // {{$name}}default{{/name}} — overridable named block.
+    //
+    // `indent` is the block's intrinsic indent (leading whitespace on its
+    // line in the source). When the block expands a multi-line override or
+    // default body, this indent is prepended after every newline so each
+    // rendered line aligns with the block tag's column.
     pub const Block = struct {
         name: []const u8,
         body: []const Node,
+        indent: []const u8 = "",
     };
 
     // {{<parent}}...{{/parent}} — invokes a partial as a "parent template",

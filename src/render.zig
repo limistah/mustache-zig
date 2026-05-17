@@ -34,16 +34,26 @@ fn renderImpl(
     partials: ?*const Partials,
 ) RenderError!void {
     const top = Frame{ .value = value, .parent = null };
-    return renderNodes(template.nodes, writer, &top, partials, null, null);
+    var state: IndentState = .{};
+    return renderNodes(template.nodes, writer, &top, partials, &state, null);
 }
 
-// When `indent` is non-null, the renderer is inside a partial that needs its
-// indent string prepended at the start of every structural line. The spec
-// requires that indent applies only to the partial source's *text*; multi-
-// line expansions from variables/sections are not re-indented per line.
+// Line-aware rendering state, always present (so even at the top level we
+// know whether the next output begins a line). Partials and blocks push a
+// new state by saving/restoring fields around their render.
+//
+//   indent: prepended after every \n inside structural text.
+//   strip:  common leading whitespace to remove from override-body lines
+//           before the indent is added (the block-reindentation rule —
+//           "Block indentation is removed at the site of definition and
+//           added at the site of expansion").
+//   at_line_start: true if the next char would start a line. Updated by
+//                  text writes only; variable/section expansions are opaque
+//                  per the Mustache standalone-indent rule.
 const IndentState = struct {
-    indent: []const u8,
-    at_line_start: bool,
+    indent: []const u8 = "",
+    strip: []const u8 = "",
+    at_line_start: bool = true,
 };
 
 // Stack of block-override frames for inheritance (Mustache 1.4). Each
@@ -76,15 +86,19 @@ fn renderNodes(
     w: *Writer,
     top: *const Frame,
     partials: ?*const Partials,
-    ind: ?*IndentState,
+    ind: *IndentState,
     overrides: ?*const OverrideFrame,
 ) RenderError!void {
     for (nodes) |node| {
         switch (node) {
-            .text => |t| try writeTextMaybeIndented(w, t, ind),
+            .text => |t| try writeTextIndented(w, t, ind),
             .variable => |v| {
                 try writeIndentIfStart(w, ind);
                 try writeVariable(w, top, v.path, v.escape);
+                // Variables/sections are opaque for line-position tracking
+                // (the partial-indent spec rule). After a variable expansion
+                // we're conservatively no longer at a line start.
+                ind.at_line_start = false;
             },
             .section => |s| {
                 try writeIndentIfStart(w, ind);
@@ -96,49 +110,58 @@ fn renderNodes(
             },
             .partial => |p| {
                 try writeIndentIfStart(w, ind);
-                try renderPartial(w, top, p, partials, overrides);
+                try renderPartial(w, top, p, partials, ind, overrides);
             },
-            .block => |b| {
-                // Bare {{$name}} default-or-overridden render. Indent is
-                // applied at the start (writeIndentIfStart) but the body
-                // itself is rendered without inherited indent (default or
-                // override content is treated as a fresh scope per spec).
-                try writeIndentIfStart(w, ind);
-                const body = OverrideFrame.lookup(overrides, b.name) orelse b.body;
-                try renderNodes(body, w, top, partials, ind, overrides);
-            },
+            .block => |b| try renderBlock(w, top, b, partials, ind, overrides),
             .parent => |pi| {
                 try writeIndentIfStart(w, ind);
-                try renderParentInvocation(w, top, pi, partials, overrides);
+                try renderParentInvocation(w, top, pi, partials, ind, overrides);
             },
         }
     }
 }
 
-fn writeIndentIfStart(w: *Writer, ind: ?*IndentState) RenderError!void {
-    if (ind) |s| {
-        if (s.at_line_start) {
-            try w.writeAll(s.indent);
-            s.at_line_start = false;
-        }
+fn writeIndentIfStart(w: *Writer, ind: *IndentState) RenderError!void {
+    if (ind.at_line_start and ind.indent.len > 0) {
+        try w.writeAll(ind.indent);
+        ind.at_line_start = false;
     }
 }
 
-fn writeTextMaybeIndented(w: *Writer, text: []const u8, ind: ?*IndentState) RenderError!void {
-    const s = ind orelse return w.writeAll(text);
-    var start: usize = 0;
-    for (text, 0..) |b, i| {
-        if (s.at_line_start) {
-            if (b != '\n') try w.writeAll(s.indent);
-            s.at_line_start = false;
+// Write `text` while honoring the indent state. After a newline (and at the
+// start of `text` if at_line_start was true), optionally strip a common-ws
+// prefix and then emit the indent.
+fn writeTextIndented(w: *Writer, text: []const u8, ind: *IndentState) RenderError!void {
+    var i: usize = 0;
+    while (i < text.len) {
+        if (ind.at_line_start) {
+            // Strip body's common leading ws if present at this line start.
+            if (ind.strip.len > 0 and text.len - i >= ind.strip.len and
+                std.mem.startsWith(u8, text[i..], ind.strip))
+            {
+                i += ind.strip.len;
+            }
+            if (i >= text.len) {
+                // line was just the strip prefix — nothing else, nothing to emit.
+                return;
+            }
+            if (text[i] != '\n') {
+                if (ind.indent.len > 0) try w.writeAll(ind.indent);
+            }
+            ind.at_line_start = false;
         }
-        if (b == '\n') {
-            try w.writeAll(text[start .. i + 1]);
-            start = i + 1;
-            s.at_line_start = true;
+        // emit a run up to and including the next \n, or the rest.
+        const start = i;
+        while (i < text.len and text[i] != '\n') : (i += 1) {}
+        if (i < text.len) {
+            // include the \n
+            i += 1;
+            try w.writeAll(text[start..i]);
+            ind.at_line_start = true;
+        } else {
+            try w.writeAll(text[start..i]);
         }
     }
-    if (start < text.len) try w.writeAll(text[start..]);
 }
 
 fn isImplicitDot(path: []const []const u8) bool {
@@ -187,7 +210,7 @@ fn renderSection(
     section: ast.Node.Section,
     inverted: bool,
     partials: ?*const Partials,
-    ind: ?*IndentState,
+    ind: *IndentState,
     overrides: ?*const OverrideFrame,
 ) RenderError!void {
     const resolved: ?Value = if (isImplicitDot(section.path)) top.value else lookupPath(top, section.path);
@@ -207,7 +230,7 @@ fn dispatchSection(
     value: Value,
     body: []const ast.Node,
     partials: ?*const Partials,
-    ind: ?*IndentState,
+    ind: *IndentState,
     overrides: ?*const OverrideFrame,
 ) RenderError!void {
     switch (value) {
@@ -257,6 +280,7 @@ fn renderPartial(
     top: *const Frame,
     p: ast.Node.Partial,
     partials: ?*const Partials,
+    ind: *IndentState,
     overrides: ?*const OverrideFrame,
 ) RenderError!void {
     const map = partials orelse return;
@@ -270,11 +294,11 @@ fn renderPartial(
     const tmpl = map.get(name) orelse return;
 
     if (p.indent.len == 0) {
-        return renderNodes(tmpl.nodes, w, top, partials, null, overrides);
+        return renderNodes(tmpl.nodes, w, top, partials, ind, overrides);
     }
-
-    var state = IndentState{ .indent = p.indent, .at_line_start = true };
-    return renderNodes(tmpl.nodes, w, top, partials, &state, overrides);
+    var nested: IndentState = .{ .indent = p.indent, .at_line_start = true };
+    try renderNodes(tmpl.nodes, w, top, partials, &nested, overrides);
+    ind.at_line_start = nested.at_line_start;
 }
 
 fn renderParentInvocation(
@@ -282,6 +306,7 @@ fn renderParentInvocation(
     top: *const Frame,
     pi: ast.Node.ParentInvocation,
     partials: ?*const Partials,
+    ind: *IndentState,
     overrides: ?*const OverrideFrame,
 ) RenderError!void {
     const map = partials orelse return;
@@ -290,11 +315,109 @@ fn renderParentInvocation(
     const frame = OverrideFrame{ .blocks = pi.overrides, .parent = overrides };
 
     if (pi.indent.len == 0) {
-        return renderNodes(tmpl.nodes, w, top, partials, null, &frame);
+        return renderNodes(tmpl.nodes, w, top, partials, ind, &frame);
+    }
+    var nested: IndentState = .{ .indent = pi.indent, .at_line_start = true };
+    try renderNodes(tmpl.nodes, w, top, partials, &nested, &frame);
+    ind.at_line_start = nested.at_line_start;
+}
+
+fn renderBlock(
+    w: *Writer,
+    top: *const Frame,
+    b: ast.Node.Block,
+    partials: ?*const Partials,
+    ind: *IndentState,
+    overrides: ?*const OverrideFrame,
+) RenderError!void {
+    const overridden = OverrideFrame.lookup(overrides, b.name);
+    const body = overridden orelse b.body;
+
+    // Effective indent (added at expansion site): the block's intrinsic
+    // indent if its tag had leading whitespace, otherwise the default body's
+    // common leading whitespace (the "Intrinsic indentation" rule).
+    var effective_indent = b.indent;
+    if (effective_indent.len == 0) {
+        effective_indent = computeCommonIndent(b.body);
     }
 
-    var state = IndentState{ .indent = pi.indent, .at_line_start = true };
-    return renderNodes(tmpl.nodes, w, top, partials, &state, &frame);
+    // Common leading whitespace of the body to be rendered — always stripped
+    // at expansion so the indent at definition site is normalized away
+    // ("Block indentation is removed at the site of definition").
+    const common_strip = computeCommonIndent(body);
+
+    if (effective_indent.len == 0 and common_strip.len == 0) {
+        try writeIndentIfStart(w, ind);
+        return renderNodes(body, w, top, partials, ind, overrides);
+    }
+
+    var nested: IndentState = .{
+        .indent = effective_indent,
+        .strip = common_strip,
+        .at_line_start = ind.at_line_start,
+    };
+    try renderNodes(body, w, top, partials, &nested, overrides);
+    ind.at_line_start = nested.at_line_start;
+}
+
+// Compute the longest common leading-whitespace prefix across non-empty
+// lines in a node tree. Lines that start with text contribute their leading
+// run of spaces/tabs. Lines that start with a $block contribute the block's
+// intrinsic indent (which is the leading ws of the block tag's source line).
+// Other non-text nodes at line start (variables, sections, parent
+// invocations) are treated as "0 leading ws" — which collapses common to
+// empty for that line.
+fn computeCommonIndent(nodes: []const ast.Node) []const u8 {
+    var common: ?[]const u8 = null;
+    var at_line_start = true;
+    const apply = struct {
+        fn f(c: *?[]const u8, line: []const u8) bool {
+            if (c.*) |existing| {
+                c.* = longestCommonPrefix(existing, line);
+                if (c.*.?.len == 0) return false; // exhausted
+            } else {
+                c.* = line;
+            }
+            return true;
+        }
+    }.f;
+    for (nodes) |n| {
+        switch (n) {
+            .text => |t| {
+                var i: usize = 0;
+                while (i < t.len) {
+                    if (at_line_start) {
+                        const start = i;
+                        while (i < t.len and (t[i] == ' ' or t[i] == '\t')) : (i += 1) {}
+                        // Empty lines (just \n) don't constrain.
+                        if (i < t.len and t[i] != '\n') {
+                            if (!apply(&common, t[start..i])) return "";
+                        }
+                        at_line_start = false;
+                    }
+                    if (i < t.len and t[i] == '\n') at_line_start = true;
+                    i += 1;
+                }
+            },
+            .block => |b| {
+                if (at_line_start) {
+                    if (!apply(&common, b.indent)) return "";
+                    at_line_start = false;
+                }
+            },
+            else => {
+                if (at_line_start) return "";
+            },
+        }
+    }
+    return common orelse "";
+}
+
+fn longestCommonPrefix(a: []const u8, b: []const u8) []const u8 {
+    const n = @min(a.len, b.len);
+    var i: usize = 0;
+    while (i < n and a[i] == b[i]) : (i += 1) {}
+    return a[0..i];
 }
 
 // ----- value writer -----
