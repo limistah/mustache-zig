@@ -112,7 +112,7 @@ fn parseSegment(
 
         const sigil = inner[0];
         const is_block = !triple and
-            (sigil == '#' or sigil == '^' or sigil == '/' or sigil == '!' or sigil == '=');
+            (sigil == '#' or sigil == '^' or sigil == '/' or sigil == '!' or sigil == '=' or sigil == '>');
 
         const after_close = close_idx + close_seq.len;
 
@@ -169,6 +169,16 @@ fn parseSegment(
                 if (raw.len == 0) return error.EmptyTag;
                 const path = try buildPath(aalloc, raw);
                 try nodes.append(aalloc, .{ .variable = .{ .path = path, .escape = false } });
+            },
+            '>' => {
+                const raw = std.mem.trim(u8, inner[1..], " \t");
+                if (raw.len == 0) return error.EmptyTag;
+                // Capture leading whitespace for the standalone-indent rule.
+                // src is the snapshot taken at the top of the loop iteration;
+                // line_start hasn't moved since (we haven't seen \n yet).
+                const indent: []const u8 = if (standalone) src[state.line_start..i] else "";
+                consumeStandaloneTail(state, standalone, rhs_end);
+                try nodes.append(aalloc, .{ .partial = .{ .name = raw, .indent = indent } });
             },
             '=' => {
                 // {{=NEW_OPEN NEW_CLOSE=}}  (with current open/close)

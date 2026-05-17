@@ -4,35 +4,102 @@ const escape = @import("escape.zig");
 const Value = @import("value.zig").Value;
 const Writer = std.Io.Writer;
 
-// The renderer operates only on Value. The earlier comptime/struct path was
-// removed because it caused combinatorial monomorphization on every distinct
-// context type, making compile time and memory unbounded. Convert structs to
-// Value via Value adapters before rendering.
-
 pub const RenderError = Writer.Error;
 
-// Lexical context stack as a singly-linked list of frames living on the
-// renderer's call stack. No heap allocations during render; nesting depth is
-// bounded by the host's stack size.
+/// Pre-parsed partials, keyed by name. Caller owns the templates.
+pub const Partials = std.StringHashMap(ast.Template);
+
 const Frame = struct {
     value: Value,
     parent: ?*const Frame,
 };
 
 pub fn render(template: ast.Template, writer: *Writer, value: Value) RenderError!void {
-    const top = Frame{ .value = value, .parent = null };
-    return renderNodes(template.nodes, writer, &top);
+    return renderImpl(template, writer, value, null);
 }
 
-fn renderNodes(nodes: []const ast.Node, w: *Writer, top: *const Frame) RenderError!void {
+pub fn renderWithPartials(
+    template: ast.Template,
+    writer: *Writer,
+    value: Value,
+    partials: *const Partials,
+) RenderError!void {
+    return renderImpl(template, writer, value, partials);
+}
+
+fn renderImpl(
+    template: ast.Template,
+    writer: *Writer,
+    value: Value,
+    partials: ?*const Partials,
+) RenderError!void {
+    const top = Frame{ .value = value, .parent = null };
+    return renderNodes(template.nodes, writer, &top, partials, null);
+}
+
+// When `indent` is non-null, the renderer is inside a partial that needs its
+// indent string prepended at the start of every structural line. The spec
+// requires that indent applies only to the partial source's *text*; multi-
+// line expansions from variables/sections are not re-indented per line.
+const IndentState = struct {
+    indent: []const u8,
+    at_line_start: bool,
+};
+
+fn renderNodes(
+    nodes: []const ast.Node,
+    w: *Writer,
+    top: *const Frame,
+    partials: ?*const Partials,
+    ind: ?*IndentState,
+) RenderError!void {
     for (nodes) |node| {
         switch (node) {
-            .text => |t| try w.writeAll(t),
-            .variable => |v| try writeVariable(w, top, v.path, v.escape),
-            .section => |s| try renderSection(w, top, s, false),
-            .inverted => |s| try renderSection(w, top, s, true),
+            .text => |t| try writeTextMaybeIndented(w, t, ind),
+            .variable => |v| {
+                try writeIndentIfStart(w, ind);
+                try writeVariable(w, top, v.path, v.escape);
+            },
+            .section => |s| {
+                try writeIndentIfStart(w, ind);
+                try renderSection(w, top, s, false, partials, ind);
+            },
+            .inverted => |s| {
+                try writeIndentIfStart(w, ind);
+                try renderSection(w, top, s, true, partials, ind);
+            },
+            .partial => |p| {
+                try writeIndentIfStart(w, ind);
+                try renderPartial(w, top, p, partials);
+            },
         }
     }
+}
+
+fn writeIndentIfStart(w: *Writer, ind: ?*IndentState) RenderError!void {
+    if (ind) |s| {
+        if (s.at_line_start) {
+            try w.writeAll(s.indent);
+            s.at_line_start = false;
+        }
+    }
+}
+
+fn writeTextMaybeIndented(w: *Writer, text: []const u8, ind: ?*IndentState) RenderError!void {
+    const s = ind orelse return w.writeAll(text);
+    var start: usize = 0;
+    for (text, 0..) |b, i| {
+        if (s.at_line_start) {
+            if (b != '\n') try w.writeAll(s.indent);
+            s.at_line_start = false;
+        }
+        if (b == '\n') {
+            try w.writeAll(text[start .. i + 1]);
+            start = i + 1;
+            s.at_line_start = true;
+        }
+    }
+    if (start < text.len) try w.writeAll(text[start..]);
 }
 
 fn isImplicitDot(path: []const []const u8) bool {
@@ -46,12 +113,8 @@ fn writeVariable(w: *Writer, top: *const Frame, path: []const []const u8, do_esc
     if (lookupPath(top, path)) |resolved| {
         try writeValue(w, resolved, do_escape);
     }
-    // missing -> emit nothing (spec)
 }
 
-// Walk frames innermost -> outermost looking for `path[0]`. Once a frame
-// containing it is found, commit to that resolution path: subsequent
-// segments only descend into the resolved object, no stack fallback.
 fn lookupPath(top: *const Frame, path: []const []const u8) ?Value {
     var cur: ?*const Frame = top;
     while (cur) |frame| : (cur = frame.parent) {
@@ -79,43 +142,57 @@ fn descend(value: Value, rest: []const []const u8) ?Value {
 
 // ----- section -----
 
-fn renderSection(w: *Writer, top: *const Frame, section: ast.Node.Section, inverted: bool) RenderError!void {
+fn renderSection(
+    w: *Writer,
+    top: *const Frame,
+    section: ast.Node.Section,
+    inverted: bool,
+    partials: ?*const Partials,
+    ind: ?*IndentState,
+) RenderError!void {
     const resolved: ?Value = if (isImplicitDot(section.path)) top.value else lookupPath(top, section.path);
 
     if (inverted) {
         const v: Value = resolved orelse .null;
-        if (isFalsy(v)) try renderNodes(section.body, w, top);
+        if (isFalsy(v)) try renderNodes(section.body, w, top, partials, ind);
         return;
     }
 
-    if (resolved) |v| try dispatchSection(w, top, v, section.body);
+    if (resolved) |v| try dispatchSection(w, top, v, section.body, partials, ind);
 }
 
-fn dispatchSection(w: *Writer, top: *const Frame, value: Value, body: []const ast.Node) RenderError!void {
+fn dispatchSection(
+    w: *Writer,
+    top: *const Frame,
+    value: Value,
+    body: []const ast.Node,
+    partials: ?*const Partials,
+    ind: ?*IndentState,
+) RenderError!void {
     switch (value) {
         .null => {},
-        .bool => |b| if (b) try renderNodes(body, w, top),
+        .bool => |b| if (b) try renderNodes(body, w, top, partials, ind),
         .int => |i| if (i != 0) {
             const f = Frame{ .value = value, .parent = top };
-            try renderNodes(body, w, &f);
+            try renderNodes(body, w, &f, partials, ind);
         },
         .float => |fv| if (fv != 0) {
             const f = Frame{ .value = value, .parent = top };
-            try renderNodes(body, w, &f);
+            try renderNodes(body, w, &f, partials, ind);
         },
         .string => |s| if (s.len > 0) {
             const f = Frame{ .value = value, .parent = top };
-            try renderNodes(body, w, &f);
+            try renderNodes(body, w, &f, partials, ind);
         },
         .list => |xs| {
             for (xs) |item| {
                 const f = Frame{ .value = item, .parent = top };
-                try renderNodes(body, w, &f);
+                try renderNodes(body, w, &f, partials, ind);
             }
         },
         .object => {
             const f = Frame{ .value = value, .parent = top };
-            try renderNodes(body, w, &f);
+            try renderNodes(body, w, &f, partials, ind);
         },
     }
 }
@@ -132,6 +209,25 @@ fn isFalsy(v: Value) bool {
     };
 }
 
+// ----- partial -----
+
+fn renderPartial(
+    w: *Writer,
+    top: *const Frame,
+    p: ast.Node.Partial,
+    partials: ?*const Partials,
+) RenderError!void {
+    const map = partials orelse return;
+    const tmpl = map.get(p.name) orelse return;
+
+    if (p.indent.len == 0) {
+        return renderNodes(tmpl.nodes, w, top, partials, null);
+    }
+
+    var state = IndentState{ .indent = p.indent, .at_line_start = true };
+    return renderNodes(tmpl.nodes, w, top, partials, &state);
+}
+
 // ----- value writer -----
 
 fn writeValue(w: *Writer, value: Value, do_escape: bool) RenderError!void {
@@ -141,7 +237,6 @@ fn writeValue(w: *Writer, value: Value, do_escape: bool) RenderError!void {
         .int => |i| try w.print("{d}", .{i}),
         .float => |f| try w.print("{d}", .{f}),
         .string => |s| if (do_escape) try escape.html(w, s) else try w.writeAll(s),
-        // Writing list/object as a leaf is unspecified; emit nothing.
         .list, .object => {},
     }
 }
@@ -279,4 +374,54 @@ test "deeply nested sections" {
     const got = try renderToBuf(64, "{{#a}}{{#b}}{{c}}{{/b}}{{/a}}", .{ .object = &a });
     defer testing.allocator.free(got);
     try testing.expectEqualStrings("found", got);
+}
+
+// ----- partials -----
+
+test "partial: inlines named partial content" {
+    var ptmpl = try parser.parse(testing.allocator, "[{{name}}]");
+    defer ptmpl.deinit();
+
+    var partials = Partials.init(testing.allocator);
+    defer partials.deinit();
+    try partials.put("greeting", ptmpl);
+
+    const fs = [_]Value.Field{.{ .key = "name", .value = .{ .string = "Aleem" } }};
+    var t = try parser.parse(testing.allocator, "Hi {{>greeting}}!");
+    defer t.deinit();
+
+    var buf: [64]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try renderWithPartials(t, &w, .{ .object = &fs }, &partials);
+    try testing.expectEqualStrings("Hi [Aleem]!", w.buffered());
+}
+
+test "partial: missing partial renders nothing" {
+    var partials = Partials.init(testing.allocator);
+    defer partials.deinit();
+
+    var t = try parser.parse(testing.allocator, "a{{>nope}}b");
+    defer t.deinit();
+
+    var buf: [64]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try renderWithPartials(t, &w, .null, &partials);
+    try testing.expectEqualStrings("ab", w.buffered());
+}
+
+test "partial: standalone indent is prepended to every partial line" {
+    var ptmpl = try parser.parse(testing.allocator, "line1\nline2");
+    defer ptmpl.deinit();
+
+    var partials = Partials.init(testing.allocator);
+    defer partials.deinit();
+    try partials.put("p", ptmpl);
+
+    var t = try parser.parse(testing.allocator, "  {{>p}}\n");
+    defer t.deinit();
+
+    var buf: [128]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try renderWithPartials(t, &w, .null, &partials);
+    try testing.expectEqualStrings("  line1\n  line2", w.buffered());
 }

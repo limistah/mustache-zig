@@ -1,11 +1,7 @@
 // Mustache spec conformance runner.
 //
-// Clone github.com/mustache/spec into ./spec and run with:
-//
+//     git clone https://github.com/mustache/spec mustache-zig/spec
 //     zig build spec
-//
-// Reads the four required suites from the spec repo's checked-in JSON
-// renditions. Partials, delimiters, and lambdas are deferred.
 
 const std = @import("std");
 const mustache = @import("mustache");
@@ -16,6 +12,7 @@ const required_suites = [_][]const u8{
     "spec/specs/sections.json",
     "spec/specs/inverted.json",
     "spec/specs/delimiters.json",
+    "spec/specs/partials.json",
 };
 
 const SpecFile = struct {
@@ -29,6 +26,7 @@ const SpecCase = struct {
     data: std.json.Value,
     template: []const u8,
     expected: []const u8,
+    partials: ?std.json.Value = null,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -78,11 +76,7 @@ pub fn main(init: std.process.Init) !void {
             } else {
                 fail_count += 1;
                 try err.print("  FAIL {s}\n    desc:     {s}\n    template: {s}\n    expected: {s}\n    got:      {s}\n", .{
-                    case.name,
-                    case.desc,
-                    case.template,
-                    case.expected,
-                    result.got,
+                    case.name, case.desc, case.template, case.expected, result.got,
                 });
             }
             alloc.free(result.got);
@@ -111,9 +105,25 @@ fn runCase(allocator: std.mem.Allocator, case: SpecCase) !CaseResult {
     defer arena.deinit();
     const data = try mustache.valueFromJson(arena.allocator(), case.data);
 
+    // Build a Partials map by parsing each partial source.
+    var partials: mustache.Partials = .init(allocator);
+    defer {
+        var it = partials.iterator();
+        while (it.next()) |entry| entry.value_ptr.deinit();
+        partials.deinit();
+    }
+    if (case.partials) |pjson| if (pjson == .object) {
+        var it = pjson.object.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.* != .string) continue;
+            const p = try mustache.parse(allocator, entry.value_ptr.string);
+            try partials.put(entry.key_ptr.*, p);
+        }
+    };
+
     var aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer aw.deinit();
-    try mustache.render(tmpl, &aw.writer, data);
+    try mustache.renderWithPartials(tmpl, &aw.writer, data, &partials);
 
     const got = try aw.toOwnedSlice();
     return .{ .ok = std.mem.eql(u8, got, case.expected), .got = got };
