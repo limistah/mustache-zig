@@ -1,0 +1,77 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.target.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - { name: linux-x86_64,   triple: x86_64-linux-musl,    ext: '' }
+          - { name: linux-aarch64,  triple: aarch64-linux-musl,   ext: '' }
+          - { name: macos-x86_64,   triple: x86_64-macos,         ext: '' }
+          - { name: macos-aarch64,  triple: aarch64-macos,        ext: '' }
+          - { name: windows-x86_64, triple: x86_64-windows-gnu,   ext: '.exe' }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Build (release)
+        run: zig build -Dtarget=${{ matrix.target.triple }} -Doptimize=ReleaseFast
+
+      - name: Package binary
+        run: |
+          mkdir -p dist
+          cp zig-out/bin/mustache-demo${{ matrix.target.ext }} \
+             dist/mustache-demo-${{ github.ref_name }}-${{ matrix.target.name }}${{ matrix.target.ext }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.target.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: bin-*
+          merge-multiple: true
+
+      - name: Create source tarball
+        run: |
+          mkdir -p dist
+          git archive --format=tar.gz --prefix=mustache-zig-${{ github.ref_name }}/ \
+            -o dist/mustache-zig-${{ github.ref_name }}-source.tar.gz HEAD
+
+      - name: Compute Zig package hash (for build.zig.zon consumers)
+        run: |
+          curl -fL -o /tmp/src.tar.gz \
+            "https://github.com/${{ github.repository }}/archive/refs/tags/${{ github.ref_name }}.tar.gz"
+          echo "Source tarball SHA256:"
+          sha256sum /tmp/src.tar.gz | tee dist/SHA256SUMS
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
