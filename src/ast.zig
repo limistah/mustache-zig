@@ -6,6 +6,8 @@ pub const Node = union(enum) {
     section: Section,
     inverted: Section,
     partial: Partial,
+    block: Block,
+    parent: ParentInvocation,
 
     pub const Variable = struct {
         path: []const []const u8,
@@ -17,12 +19,31 @@ pub const Node = union(enum) {
         body: []const Node,
     };
 
-    pub const Partial = struct {
+    // {{$name}}default{{/name}} — overridable named block.
+    pub const Block = struct {
         name: []const u8,
-        // Leading whitespace of the partial tag's line if the tag was
-        // standalone; empty otherwise. Per spec, this indent is prepended to
-        // every line of the rendered partial.
+        body: []const Node,
+    };
+
+    // {{<parent}}...{{/parent}} — invokes a partial as a "parent template",
+    // where the invocation body contains {{$block}} overrides that replace
+    // matching blocks in the parent. Mustache 1.4 inheritance feature.
+    pub const ParentInvocation = struct {
+        name: []const u8,
         indent: []const u8,
+        overrides: []const Block,
+    };
+
+    pub const Partial = struct {
+        // For static partials ({{>name}}), `name` is the literal partial name
+        // and `path` is empty. For dynamic partials ({{>*key.path}}, Mustache
+        // 1.4), `path` is the dotted lookup path resolved against context to
+        // obtain the actual partial name at render time, and `name` holds the
+        // raw lookup string (unused at render).
+        name: []const u8,
+        path: []const []const u8,
+        indent: []const u8,
+        dynamic: bool,
     };
 };
 

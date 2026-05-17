@@ -34,7 +34,7 @@ fn renderImpl(
     partials: ?*const Partials,
 ) RenderError!void {
     const top = Frame{ .value = value, .parent = null };
-    return renderNodes(template.nodes, writer, &top, partials, null);
+    return renderNodes(template.nodes, writer, &top, partials, null, null);
 }
 
 // When `indent` is non-null, the renderer is inside a partial that needs its
@@ -46,12 +46,38 @@ const IndentState = struct {
     at_line_start: bool,
 };
 
+// Stack of block-override frames for inheritance (Mustache 1.4). Each
+// {{<parent}}...{{/parent}} invocation pushes a new frame holding the
+// {{$name}} blocks collected from its body. Lookup walks the chain
+// OUTERMOST first — the original caller's overrides take precedence over
+// any added by intermediate parent templates ("Multi-level inheritance"
+// test in the spec).
+const OverrideFrame = struct {
+    blocks: []const ast.Node.Block,
+    parent: ?*const OverrideFrame,
+
+    fn lookup(self: ?*const OverrideFrame, name: []const u8) ?[]const ast.Node {
+        var result: ?[]const ast.Node = null;
+        var cur: ?*const OverrideFrame = self;
+        while (cur) |f| : (cur = f.parent) {
+            for (f.blocks) |b| {
+                if (std.mem.eql(u8, b.name, name)) {
+                    result = b.body;
+                    break;
+                }
+            }
+        }
+        return result;
+    }
+};
+
 fn renderNodes(
     nodes: []const ast.Node,
     w: *Writer,
     top: *const Frame,
     partials: ?*const Partials,
     ind: ?*IndentState,
+    overrides: ?*const OverrideFrame,
 ) RenderError!void {
     for (nodes) |node| {
         switch (node) {
@@ -62,15 +88,28 @@ fn renderNodes(
             },
             .section => |s| {
                 try writeIndentIfStart(w, ind);
-                try renderSection(w, top, s, false, partials, ind);
+                try renderSection(w, top, s, false, partials, ind, overrides);
             },
             .inverted => |s| {
                 try writeIndentIfStart(w, ind);
-                try renderSection(w, top, s, true, partials, ind);
+                try renderSection(w, top, s, true, partials, ind, overrides);
             },
             .partial => |p| {
                 try writeIndentIfStart(w, ind);
-                try renderPartial(w, top, p, partials);
+                try renderPartial(w, top, p, partials, overrides);
+            },
+            .block => |b| {
+                // Bare {{$name}} default-or-overridden render. Indent is
+                // applied at the start (writeIndentIfStart) but the body
+                // itself is rendered without inherited indent (default or
+                // override content is treated as a fresh scope per spec).
+                try writeIndentIfStart(w, ind);
+                const body = OverrideFrame.lookup(overrides, b.name) orelse b.body;
+                try renderNodes(body, w, top, partials, ind, overrides);
+            },
+            .parent => |pi| {
+                try writeIndentIfStart(w, ind);
+                try renderParentInvocation(w, top, pi, partials, overrides);
             },
         }
     }
@@ -149,16 +188,17 @@ fn renderSection(
     inverted: bool,
     partials: ?*const Partials,
     ind: ?*IndentState,
+    overrides: ?*const OverrideFrame,
 ) RenderError!void {
     const resolved: ?Value = if (isImplicitDot(section.path)) top.value else lookupPath(top, section.path);
 
     if (inverted) {
         const v: Value = resolved orelse .null;
-        if (isFalsy(v)) try renderNodes(section.body, w, top, partials, ind);
+        if (isFalsy(v)) try renderNodes(section.body, w, top, partials, ind, overrides);
         return;
     }
 
-    if (resolved) |v| try dispatchSection(w, top, v, section.body, partials, ind);
+    if (resolved) |v| try dispatchSection(w, top, v, section.body, partials, ind, overrides);
 }
 
 fn dispatchSection(
@@ -168,31 +208,32 @@ fn dispatchSection(
     body: []const ast.Node,
     partials: ?*const Partials,
     ind: ?*IndentState,
+    overrides: ?*const OverrideFrame,
 ) RenderError!void {
     switch (value) {
         .null => {},
-        .bool => |b| if (b) try renderNodes(body, w, top, partials, ind),
+        .bool => |b| if (b) try renderNodes(body, w, top, partials, ind, overrides),
         .int => |i| if (i != 0) {
             const f = Frame{ .value = value, .parent = top };
-            try renderNodes(body, w, &f, partials, ind);
+            try renderNodes(body, w, &f, partials, ind, overrides);
         },
         .float => |fv| if (fv != 0) {
             const f = Frame{ .value = value, .parent = top };
-            try renderNodes(body, w, &f, partials, ind);
+            try renderNodes(body, w, &f, partials, ind, overrides);
         },
         .string => |s| if (s.len > 0) {
             const f = Frame{ .value = value, .parent = top };
-            try renderNodes(body, w, &f, partials, ind);
+            try renderNodes(body, w, &f, partials, ind, overrides);
         },
         .list => |xs| {
             for (xs) |item| {
                 const f = Frame{ .value = item, .parent = top };
-                try renderNodes(body, w, &f, partials, ind);
+                try renderNodes(body, w, &f, partials, ind, overrides);
             }
         },
         .object => {
             const f = Frame{ .value = value, .parent = top };
-            try renderNodes(body, w, &f, partials, ind);
+            try renderNodes(body, w, &f, partials, ind, overrides);
         },
     }
 }
@@ -216,16 +257,44 @@ fn renderPartial(
     top: *const Frame,
     p: ast.Node.Partial,
     partials: ?*const Partials,
+    overrides: ?*const OverrideFrame,
 ) RenderError!void {
     const map = partials orelse return;
-    const tmpl = map.get(p.name) orelse return;
+
+    const name: []const u8 = if (p.dynamic) blk: {
+        const resolved = lookupPath(top, p.path) orelse return;
+        if (resolved != .string) return;
+        break :blk resolved.string;
+    } else p.name;
+
+    const tmpl = map.get(name) orelse return;
 
     if (p.indent.len == 0) {
-        return renderNodes(tmpl.nodes, w, top, partials, null);
+        return renderNodes(tmpl.nodes, w, top, partials, null, overrides);
     }
 
     var state = IndentState{ .indent = p.indent, .at_line_start = true };
-    return renderNodes(tmpl.nodes, w, top, partials, &state);
+    return renderNodes(tmpl.nodes, w, top, partials, &state, overrides);
+}
+
+fn renderParentInvocation(
+    w: *Writer,
+    top: *const Frame,
+    pi: ast.Node.ParentInvocation,
+    partials: ?*const Partials,
+    overrides: ?*const OverrideFrame,
+) RenderError!void {
+    const map = partials orelse return;
+    const tmpl = map.get(pi.name) orelse return;
+
+    const frame = OverrideFrame{ .blocks = pi.overrides, .parent = overrides };
+
+    if (pi.indent.len == 0) {
+        return renderNodes(tmpl.nodes, w, top, partials, null, &frame);
+    }
+
+    var state = IndentState{ .indent = pi.indent, .at_line_start = true };
+    return renderNodes(tmpl.nodes, w, top, partials, &state, &frame);
 }
 
 // ----- value writer -----

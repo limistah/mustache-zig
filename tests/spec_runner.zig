@@ -13,6 +13,14 @@ const required_suites = [_][]const u8{
     "spec/specs/inverted.json",
     "spec/specs/delimiters.json",
     "spec/specs/partials.json",
+    "spec/specs/~dynamic-names.json",
+};
+
+// Optional suites: we try to pass these but failures are reported as warnings
+// and do not fail the build. They cover Mustache 1.4 features (inheritance,
+// lambdas) where partial support is acceptable for a v0.x release.
+const optional_suites = [_][]const u8{
+    "spec/specs/~inheritance.json",
 };
 
 const SpecFile = struct {
@@ -41,8 +49,18 @@ pub fn main(init: std.process.Init) !void {
     var total: usize = 0;
     var passed: usize = 0;
     var fail_count: usize = 0;
+    var optional_total: usize = 0;
+    var optional_passed: usize = 0;
+    var optional_fails: usize = 0;
 
-    for (required_suites) |path| {
+    const Suite = struct { path: []const u8, optional: bool };
+    var suites: std.ArrayList(Suite) = .empty;
+    defer suites.deinit(alloc);
+    for (required_suites) |p| try suites.append(alloc, .{ .path = p, .optional = false });
+    for (optional_suites) |p| try suites.append(alloc, .{ .path = p, .optional = true });
+
+    for (suites.items) |suite| {
+        const path = suite.path;
         const cwd = std.Io.Dir.cwd();
         const file = cwd.openFile(io, path, .{}) catch |e| {
             try err.print("could not open {s}: {s}\n", .{ path, @errorName(e) });
@@ -62,19 +80,20 @@ pub fn main(init: std.process.Init) !void {
         });
         defer parsed.deinit();
 
-        try err.print("--- {s} ({d} cases)\n", .{ path, parsed.value.tests.len });
+        const tag = if (suite.optional) "(optional)" else "";
+        try err.print("--- {s} ({d} cases) {s}\n", .{ path, parsed.value.tests.len, tag });
 
         for (parsed.value.tests) |case| {
-            total += 1;
+            if (suite.optional) optional_total += 1 else total += 1;
             const result = runCase(alloc, case) catch |e| {
-                fail_count += 1;
+                if (suite.optional) optional_fails += 1 else fail_count += 1;
                 try err.print("  ERR  {s}: {s}\n", .{ case.name, @errorName(e) });
                 continue;
             };
             if (result.ok) {
-                passed += 1;
+                if (suite.optional) optional_passed += 1 else passed += 1;
             } else {
-                fail_count += 1;
+                if (suite.optional) optional_fails += 1 else fail_count += 1;
                 try err.print("  FAIL {s}\n    desc:     {s}\n    template: {s}\n    expected: {s}\n    got:      {s}\n", .{
                     case.name, case.desc, case.template, case.expected, result.got,
                 });
@@ -83,13 +102,14 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    try err.print("\n{d}/{d} passed", .{ passed, total });
-    if (fail_count > 0) {
-        try err.print(" ({d} failed)\n", .{fail_count});
-        try err.flush();
-        std.process.exit(1);
+    try err.print("\nrequired: {d}/{d} passed", .{ passed, total });
+    if (fail_count > 0) try err.print(" ({d} failed)", .{fail_count});
+    if (optional_total > 0) {
+        try err.print("\noptional: {d}/{d} passed", .{ optional_passed, optional_total });
+        if (optional_fails > 0) try err.print(" ({d} failed; informational only)", .{optional_fails});
     }
     try err.writeAll("\n");
+    if (fail_count > 0) std.process.exit(1);
 }
 
 const CaseResult = struct {
