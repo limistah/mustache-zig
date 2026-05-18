@@ -2,12 +2,24 @@ const std = @import("std");
 const ast = @import("ast.zig");
 const escape = @import("escape.zig");
 const Value = @import("value.zig").Value;
+const parser = @import("parser.zig");
 const Writer = std.Io.Writer;
 
-pub const RenderError = Writer.Error;
+// Combined error set. Rendering may fail on write errors, allocation
+// errors during lambda re-parsing, or parse errors when a lambda's return
+// value isn't well-formed Mustache.
+pub const RenderError = Writer.Error || std.mem.Allocator.Error || parser.ParseError;
 
 /// Pre-parsed partials, keyed by name. Caller owns the templates.
 pub const Partials = std.StringHashMap(ast.Template);
+
+/// Renderer options. `allocator` is required if templates may invoke
+/// lambdas (the renderer needs to allocate for the lambda's return value
+/// and the parsed sub-template). If absent, lambdas render as empty.
+pub const RenderOptions = struct {
+    partials: ?*const Partials = null,
+    allocator: ?std.mem.Allocator = null,
+};
 
 const Frame = struct {
     value: Value,
@@ -15,7 +27,7 @@ const Frame = struct {
 };
 
 pub fn render(template: ast.Template, writer: *Writer, value: Value) RenderError!void {
-    return renderImpl(template, writer, value, null);
+    return renderEx(template, writer, value, .{});
 }
 
 pub fn renderWithPartials(
@@ -24,18 +36,18 @@ pub fn renderWithPartials(
     value: Value,
     partials: *const Partials,
 ) RenderError!void {
-    return renderImpl(template, writer, value, partials);
+    return renderEx(template, writer, value, .{ .partials = partials });
 }
 
-fn renderImpl(
+pub fn renderEx(
     template: ast.Template,
     writer: *Writer,
     value: Value,
-    partials: ?*const Partials,
+    opts: RenderOptions,
 ) RenderError!void {
     const top = Frame{ .value = value, .parent = null };
     var state: IndentState = .{};
-    return renderNodes(template.nodes, writer, &top, partials, &state, null);
+    return renderNodes(template.nodes, writer, &top, opts.partials, &state, null, opts.allocator);
 }
 
 // Line-aware rendering state, always present (so even at the top level we
@@ -88,34 +100,32 @@ fn renderNodes(
     partials: ?*const Partials,
     ind: *IndentState,
     overrides: ?*const OverrideFrame,
+    lambda_alloc: ?std.mem.Allocator,
 ) RenderError!void {
     for (nodes) |node| {
         switch (node) {
             .text => |t| try writeTextIndented(w, t, ind),
             .variable => |v| {
                 try writeIndentIfStart(w, ind);
-                try writeVariable(w, top, v.path, v.escape);
-                // Variables/sections are opaque for line-position tracking
-                // (the partial-indent spec rule). After a variable expansion
-                // we're conservatively no longer at a line start.
+                try writeVariable(w, top, v.path, v.escape, partials, ind, overrides, lambda_alloc);
                 ind.at_line_start = false;
             },
             .section => |s| {
                 try writeIndentIfStart(w, ind);
-                try renderSection(w, top, s, false, partials, ind, overrides);
+                try renderSection(w, top, s, false, partials, ind, overrides, lambda_alloc);
             },
             .inverted => |s| {
                 try writeIndentIfStart(w, ind);
-                try renderSection(w, top, s, true, partials, ind, overrides);
+                try renderSection(w, top, s, true, partials, ind, overrides, lambda_alloc);
             },
             .partial => |p| {
                 try writeIndentIfStart(w, ind);
-                try renderPartial(w, top, p, partials, ind, overrides);
+                try renderPartial(w, top, p, partials, ind, overrides, lambda_alloc);
             },
-            .block => |b| try renderBlock(w, top, b, partials, ind, overrides),
+            .block => |b| try renderBlock(w, top, b, partials, ind, overrides, lambda_alloc),
             .parent => |pi| {
                 try writeIndentIfStart(w, ind);
-                try renderParentInvocation(w, top, pi, partials, ind, overrides);
+                try renderParentInvocation(w, top, pi, partials, ind, overrides, lambda_alloc);
             },
         }
     }
@@ -170,10 +180,19 @@ fn isImplicitDot(path: []const []const u8) bool {
 
 // ----- variable -----
 
-fn writeVariable(w: *Writer, top: *const Frame, path: []const []const u8, do_escape: bool) RenderError!void {
-    if (isImplicitDot(path)) return writeValue(w, top.value, do_escape);
+fn writeVariable(
+    w: *Writer,
+    top: *const Frame,
+    path: []const []const u8,
+    do_escape: bool,
+    partials: ?*const Partials,
+    ind: *IndentState,
+    overrides: ?*const OverrideFrame,
+    lambda_alloc: ?std.mem.Allocator,
+) RenderError!void {
+    if (isImplicitDot(path)) return writeValue(w, top.value, do_escape, top, partials, ind, overrides, lambda_alloc);
     if (lookupPath(top, path)) |resolved| {
-        try writeValue(w, resolved, do_escape);
+        try writeValue(w, resolved, do_escape, top, partials, ind, overrides, lambda_alloc);
     }
 }
 
@@ -212,53 +231,111 @@ fn renderSection(
     partials: ?*const Partials,
     ind: *IndentState,
     overrides: ?*const OverrideFrame,
+    lambda_alloc: ?std.mem.Allocator,
 ) RenderError!void {
     const resolved: ?Value = if (isImplicitDot(section.path)) top.value else lookupPath(top, section.path);
 
     if (inverted) {
         const v: Value = resolved orelse .null;
-        if (isFalsy(v)) try renderNodes(section.body, w, top, partials, ind, overrides);
+        // Spec: lambdas in inverted sections are always treated as truthy,
+        // so the body is skipped (isFalsy(.lambda) returns false).
+        if (isFalsy(v)) try renderNodes(section.body, w, top, partials, ind, overrides, lambda_alloc);
         return;
     }
 
-    if (resolved) |v| try dispatchSection(w, top, v, section.body, partials, ind, overrides);
+    if (resolved) |v| try dispatchSection(w, top, v, section, partials, ind, overrides, lambda_alloc);
 }
 
 fn dispatchSection(
     w: *Writer,
     top: *const Frame,
     value: Value,
-    body: []const ast.Node,
+    section: ast.Node.Section,
     partials: ?*const Partials,
     ind: *IndentState,
     overrides: ?*const OverrideFrame,
+    lambda_alloc: ?std.mem.Allocator,
 ) RenderError!void {
+    const body = section.body;
     switch (value) {
         .null => {},
-        .bool => |b| if (b) try renderNodes(body, w, top, partials, ind, overrides),
+        .bool => |b| if (b) try renderNodes(body, w, top, partials, ind, overrides, lambda_alloc),
         .int => |i| if (i != 0) {
             const f = Frame{ .value = value, .parent = top };
-            try renderNodes(body, w, &f, partials, ind, overrides);
+            try renderNodes(body, w, &f, partials, ind, overrides, lambda_alloc);
         },
         .float => |fv| if (fv != 0) {
             const f = Frame{ .value = value, .parent = top };
-            try renderNodes(body, w, &f, partials, ind, overrides);
+            try renderNodes(body, w, &f, partials, ind, overrides, lambda_alloc);
         },
         .string => |s| if (s.len > 0) {
             const f = Frame{ .value = value, .parent = top };
-            try renderNodes(body, w, &f, partials, ind, overrides);
+            try renderNodes(body, w, &f, partials, ind, overrides, lambda_alloc);
         },
         .list => |xs| {
             for (xs) |item| {
                 const f = Frame{ .value = item, .parent = top };
-                try renderNodes(body, w, &f, partials, ind, overrides);
+                try renderNodes(body, w, &f, partials, ind, overrides, lambda_alloc);
             }
         },
         .object => {
             const f = Frame{ .value = value, .parent = top };
-            try renderNodes(body, w, &f, partials, ind, overrides);
+            try renderNodes(body, w, &f, partials, ind, overrides, lambda_alloc);
         },
+        .lambda => |l| try callSectionLambda(l, section, w, top, partials, ind, overrides, lambda_alloc),
     }
+}
+
+fn callSectionLambda(
+    l: Value.Lambda,
+    section: ast.Node.Section,
+    w: *Writer,
+    top: *const Frame,
+    partials: ?*const Partials,
+    ind: *IndentState,
+    overrides: ?*const OverrideFrame,
+    lambda_alloc: ?std.mem.Allocator,
+) RenderError!void {
+    const alloc = lambda_alloc orelse return;
+    const out = try l.call(alloc, section.raw_body);
+    defer alloc.free(out);
+
+    var sub_tmpl = try parser.parseEx(alloc, out, section.delim_open, section.delim_close);
+    defer sub_tmpl.deinit();
+
+    try renderNodes(sub_tmpl.nodes, w, top, partials, ind, overrides, lambda_alloc);
+}
+
+fn callVariableLambda(
+    l: Value.Lambda,
+    w: *Writer,
+    do_escape: bool,
+    top: *const Frame,
+    partials: ?*const Partials,
+    ind: *IndentState,
+    overrides: ?*const OverrideFrame,
+    lambda_alloc: ?std.mem.Allocator,
+) RenderError!void {
+    const alloc = lambda_alloc orelse return;
+    const out = try l.call(alloc, null);
+    defer alloc.free(out);
+
+    // Variable-lambda return values are parsed with the default delimiters
+    // regardless of the surrounding template's delimiter state.
+    var sub_tmpl = try parser.parseEx(alloc, out, "{{", "}}");
+    defer sub_tmpl.deinit();
+
+    if (!do_escape) {
+        try renderNodes(sub_tmpl.nodes, w, top, partials, ind, overrides, lambda_alloc);
+        return;
+    }
+
+    // Escaped variable: render to a buffer, then HTML-escape the output.
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    var sub_state: IndentState = .{};
+    try renderNodes(sub_tmpl.nodes, &aw.writer, top, partials, &sub_state, overrides, lambda_alloc);
+    try escape.html(w, aw.writer.buffered());
 }
 
 fn isFalsy(v: Value) bool {
@@ -270,6 +347,9 @@ fn isFalsy(v: Value) bool {
         .string => |s| s.len == 0,
         .list => |xs| xs.len == 0,
         .object => false,
+        // Per Mustache spec: lambdas in inverted sections are always treated
+        // as truthy, so the inverted body is skipped.
+        .lambda => false,
     };
 }
 
@@ -282,6 +362,7 @@ fn renderPartial(
     partials: ?*const Partials,
     ind: *IndentState,
     overrides: ?*const OverrideFrame,
+    lambda_alloc: ?std.mem.Allocator,
 ) RenderError!void {
     const map = partials orelse return;
 
@@ -294,10 +375,10 @@ fn renderPartial(
     const tmpl = map.get(name) orelse return;
 
     if (p.indent.len == 0) {
-        return renderNodes(tmpl.nodes, w, top, partials, ind, overrides);
+        return renderNodes(tmpl.nodes, w, top, partials, ind, overrides, lambda_alloc);
     }
     var nested: IndentState = .{ .indent = p.indent, .at_line_start = true };
-    try renderNodes(tmpl.nodes, w, top, partials, &nested, overrides);
+    try renderNodes(tmpl.nodes, w, top, partials, &nested, overrides, lambda_alloc);
     ind.at_line_start = nested.at_line_start;
 }
 
@@ -308,6 +389,7 @@ fn renderParentInvocation(
     partials: ?*const Partials,
     ind: *IndentState,
     overrides: ?*const OverrideFrame,
+    lambda_alloc: ?std.mem.Allocator,
 ) RenderError!void {
     const map = partials orelse return;
     const tmpl = map.get(pi.name) orelse return;
@@ -315,10 +397,10 @@ fn renderParentInvocation(
     const frame = OverrideFrame{ .blocks = pi.overrides, .parent = overrides };
 
     if (pi.indent.len == 0) {
-        return renderNodes(tmpl.nodes, w, top, partials, ind, &frame);
+        return renderNodes(tmpl.nodes, w, top, partials, ind, &frame, lambda_alloc);
     }
     var nested: IndentState = .{ .indent = pi.indent, .at_line_start = true };
-    try renderNodes(tmpl.nodes, w, top, partials, &nested, &frame);
+    try renderNodes(tmpl.nodes, w, top, partials, &nested, &frame, lambda_alloc);
     ind.at_line_start = nested.at_line_start;
 }
 
@@ -329,26 +411,20 @@ fn renderBlock(
     partials: ?*const Partials,
     ind: *IndentState,
     overrides: ?*const OverrideFrame,
+    lambda_alloc: ?std.mem.Allocator,
 ) RenderError!void {
     const overridden = OverrideFrame.lookup(overrides, b.name);
     const body = overridden orelse b.body;
 
-    // Effective indent (added at expansion site): the block's intrinsic
-    // indent if its tag had leading whitespace, otherwise the default body's
-    // common leading whitespace (the "Intrinsic indentation" rule).
     var effective_indent = b.indent;
     if (effective_indent.len == 0) {
         effective_indent = computeCommonIndent(b.body);
     }
-
-    // Common leading whitespace of the body to be rendered — always stripped
-    // at expansion so the indent at definition site is normalized away
-    // ("Block indentation is removed at the site of definition").
     const common_strip = computeCommonIndent(body);
 
     if (effective_indent.len == 0 and common_strip.len == 0) {
         try writeIndentIfStart(w, ind);
-        return renderNodes(body, w, top, partials, ind, overrides);
+        return renderNodes(body, w, top, partials, ind, overrides, lambda_alloc);
     }
 
     var nested: IndentState = .{
@@ -356,7 +432,7 @@ fn renderBlock(
         .strip = common_strip,
         .at_line_start = ind.at_line_start,
     };
-    try renderNodes(body, w, top, partials, &nested, overrides);
+    try renderNodes(body, w, top, partials, &nested, overrides, lambda_alloc);
     ind.at_line_start = nested.at_line_start;
 }
 
@@ -422,7 +498,16 @@ fn longestCommonPrefix(a: []const u8, b: []const u8) []const u8 {
 
 // ----- value writer -----
 
-fn writeValue(w: *Writer, value: Value, do_escape: bool) RenderError!void {
+fn writeValue(
+    w: *Writer,
+    value: Value,
+    do_escape: bool,
+    top: *const Frame,
+    partials: ?*const Partials,
+    ind: *IndentState,
+    overrides: ?*const OverrideFrame,
+    lambda_alloc: ?std.mem.Allocator,
+) RenderError!void {
     switch (value) {
         .null => {},
         .bool => |b| try w.writeAll(if (b) "true" else "false"),
@@ -430,12 +515,12 @@ fn writeValue(w: *Writer, value: Value, do_escape: bool) RenderError!void {
         .float => |f| try w.print("{d}", .{f}),
         .string => |s| if (do_escape) try escape.html(w, s) else try w.writeAll(s),
         .list, .object => {},
+        .lambda => |l| try callVariableLambda(l, w, do_escape, top, partials, ind, overrides, lambda_alloc),
     }
 }
 
 // ----- tests -----
 
-const parser = @import("parser.zig");
 const testing = std.testing;
 
 fn renderToBuf(comptime cap: usize, source: []const u8, value: Value) ![]u8 {

@@ -6,12 +6,18 @@ const value_mod = @import("value.zig");
 pub const Template = ast.Template;
 pub const Node = ast.Node;
 pub const parse = parser.parse;
+pub const parseEx = parser.parseEx;
 pub const render = render_mod.render;
 pub const renderWithPartials = render_mod.renderWithPartials;
+pub const renderEx = render_mod.renderEx;
+pub const RenderOptions = render_mod.RenderOptions;
 pub const Partials = render_mod.Partials;
 pub const ParseError = parser.ParseError;
+pub const RenderError = render_mod.RenderError;
 pub const Value = value_mod.Value;
+pub const Lambda = value_mod.Value.Lambda;
 pub const valueFromJson = value_mod.fromJson;
+pub const valueFromJsonWithCodeReplacement = value_mod.fromJsonWithCodeReplacement;
 pub const escape = @import("escape.zig");
 
 test {

@@ -27,6 +27,10 @@ const State = struct {
     last_close_rhs_at_newline: bool = false,
     // Position right after the rhs whitespace, ready to consume an EOL.
     last_close_rhs_end: usize = 0,
+    // Position of the most recently consumed close tag's opener (the index
+    // of the first '{' of '{{/x}}'). Section parsing uses this to slice
+    // raw_body as source[body_start..body_end].
+    last_close_body_end: usize = 0,
 
     fn defaultDelims(self: *const State) bool {
         return std.mem.eql(u8, self.open, "{{") and std.mem.eql(u8, self.close, "}}");
@@ -34,6 +38,18 @@ const State = struct {
 };
 
 pub fn parse(allocator: std.mem.Allocator, source: []const u8) ParseError!ast.Template {
+    return parseEx(allocator, source, "{{", "}}");
+}
+
+// Parse with custom initial delimiters. Useful for re-parsing section
+// lambda output, which the spec requires to use the delimiters in effect
+// at the section's invocation site.
+pub fn parseEx(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    init_open: []const u8,
+    init_close: []const u8,
+) ParseError!ast.Template {
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
     const aalloc = arena.allocator();
@@ -43,8 +59,8 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) ParseError!ast.Te
         .source = owned,
         .cursor = 0,
         .line_start = 0,
-        .open = "{{",
-        .close = "}}",
+        .open = init_open,
+        .close = init_close,
     };
     const nodes = try parseSegment(aalloc, &state, null);
 
@@ -173,9 +189,26 @@ fn parseSegmentEx(
                 const raw = std.mem.trim(u8, inner[1..], " \t");
                 if (raw.len == 0) return error.EmptyTag;
                 const path = try buildPath(aalloc, raw);
+                // Capture delimiters in effect at the section site — used
+                // when re-parsing a section-lambda's return value.
+                const sect_open = state.open;
+                const sect_close = state.close;
                 consumeStandaloneTail(state, standalone, rhs_end);
+                const body_start = state.cursor;
+                state.last_close_body_end = body_start;
                 const body = try parseSegment(aalloc, state, raw);
-                const section = ast.Node.Section{ .path = path, .body = body };
+                const body_end = state.last_close_body_end;
+                const raw_body = if (body_end >= body_start)
+                    state.source[body_start..body_end]
+                else
+                    "";
+                const section = ast.Node.Section{
+                    .path = path,
+                    .body = body,
+                    .raw_body = raw_body,
+                    .delim_open = sect_open,
+                    .delim_close = sect_close,
+                };
                 try nodes.append(aalloc, if (sigil == '#')
                     .{ .section = section }
                 else
@@ -188,6 +221,7 @@ fn parseSegmentEx(
                 state.last_close_standalone = standalone;
                 state.last_close_rhs_at_newline = rhs_at_newline;
                 state.last_close_rhs_end = rhs_end;
+                state.last_close_body_end = i;
                 if (!preserve_close_tail) consumeStandaloneTail(state, standalone, rhs_end);
                 return try nodes.toOwnedSlice(aalloc);
             },

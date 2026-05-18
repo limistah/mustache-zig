@@ -17,6 +17,15 @@ pub const Node = union(enum) {
     pub const Section = struct {
         path: []const []const u8,
         body: []const Node,
+        // Raw source between the section's open and close tags. Used when
+        // the section value resolves to a lambda — the spec requires the
+        // lambda receive the original unrendered body text.
+        raw_body: []const u8 = "",
+        // Delimiters in effect at the section's site. Used to re-parse
+        // a section-lambda's return value with the right delimiters
+        // (alternate-delimiters lambda test).
+        delim_open: []const u8 = "{{",
+        delim_close: []const u8 = "}}",
     };
 
     // {{$name}}default{{/name}} — overridable named block.
